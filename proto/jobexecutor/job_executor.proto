@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package jobexecutor;
+
+service JobExecutor {
+    rpc Start(StartRequest) returns (StartResponse) {}
+    rpc Stop(StopRequest) returns (StopResponse) {}
+    rpc JobStatus(StatusRequest) returns (StatusResponse) {}
+    // TODO rpc VmStatus() health check, load averages, physical,logical cores etc for monitoring
+}
+
+message ExecutionId {
+    uint32 id = 1;
+}
+
+message StartRequest {
+  string path = 1;
+  repeated string args = 2;
+  // TODO env vars
+}
+
+message StartResponse {
+    ExecutionId id = 1;
+    // TODO maybe add details about free/used resources, load avgs etc?
+}
+
+message StopRequest {
+    ExecutionId id = 1;
+}
+
+message StopResponse {
+    bool success = 1;
+}
+
+message StatusRequest {
+    ExecutionId id = 1;
+}
+
+message StatusResponse {
+    string name = 1;
+    string state = 2; // TODO enum
+    // TODO add memory etc?
+}
