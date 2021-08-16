@@ -1,6 +1,7 @@
 use log::*;
 use std::collections::HashMap;
-use std::process::{Child, Command};
+use std::io::Read;
+use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use sysinfo::{ProcessExt, RefreshKind, Signal, SystemExt};
 
@@ -31,6 +32,10 @@ impl JobExecutor for MyJobExecutor {
         let child = Command::new(start_req.path)
             .args(start_req.args)
             .current_dir("/") // TODO: make configurable
+            // .env(key, val) TODO
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .context("Cannot run command")
             .map_err(|err| {
@@ -67,11 +72,20 @@ impl JobExecutor for MyJobExecutor {
             let mut child = child.lock().unwrap();
             match child.try_wait() {
                 // FIXME make consistent
-                Ok(Some(status)) => job_executor::StatusResponse {
-                    // TODO: remove from map?
-                    name: child.id().to_string(),
-                    state: status.to_string(),
-                },
+                Ok(Some(status)) => {
+                    let mut stdout = child.stdout.take().unwrap(); // will consume it
+                                                                   // TODO stderr
+                    let mut stdout_buffer = String::new();
+                    stdout.read_to_string(&mut stdout_buffer)?;
+
+                    let _name = child.id().to_string();
+
+                    job_executor::StatusResponse {
+                        // TODO: remove from map?
+                        name: stdout_buffer,
+                        state: status.to_string(),
+                    }
+                }
                 Ok(None) => job_executor::StatusResponse {
                     name: child.id().to_string(),
                     state: "Running".to_string(),
