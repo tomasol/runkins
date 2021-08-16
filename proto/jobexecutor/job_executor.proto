@@ -29,7 +29,6 @@ message StopRequest {
 }
 
 message StopResponse {
-    bool success = 1;
 }
 
 message StatusRequest {

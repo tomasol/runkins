@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
-use sysinfo::{ProcessExt, RefreshKind, Signal, SystemExt};
 
 use anyhow::Context;
 use tonic::{transport::Server, Response};
@@ -19,6 +18,8 @@ pub mod job_executor {
 pub struct MyJobExecutor {
     child_storage: Mutex<HashMap<u32, Mutex<Child>>>,
 }
+
+// TODO: consider using tokio mutex
 
 #[tonic::async_trait]
 impl JobExecutor for MyJobExecutor {
@@ -58,54 +59,52 @@ impl JobExecutor for MyJobExecutor {
         &self,
         request: tonic::Request<job_executor::StatusRequest>,
     ) -> Result<tonic::Response<job_executor::StatusResponse>, tonic::Status> {
-        // TODO: only allow managing child processes?
         debug!("Got a request: {:?}", request);
         let pid = request
             .into_inner()
             .id
             .ok_or(tonic::Status::invalid_argument("No executionId provided"))?
-            .id; // https://github.com/GuillaumeGomez/sysinfo/issues/379
+            .id;
 
         // Try to get child process from child_storage
-        let reply = if let Some(child) = self.child_storage.lock().unwrap().get(&pid) {
-            //FIXME unwrap err to tonic::Status
-            let mut child = child.lock().unwrap();
-            match child.try_wait() {
-                // FIXME make consistent
-                Ok(Some(status)) => {
-                    let mut stdout = child.stdout.take().unwrap(); // will consume it
-                                                                   // TODO stderr
-                    let mut stdout_buffer = String::new();
-                    stdout.read_to_string(&mut stdout_buffer)?;
+        let mut child_storage = self.child_storage.lock().unwrap();
+        let mut child = child_storage
+            .get(&pid)
+            .ok_or(tonic::Status::not_found("Cannot find job"))?
+            .lock()
+            .map_err(|err| {
+                error!("Mutex acquiring failed - {}", err);
+                tonic::Status::internal("Mutex acquiring failed")
+            })?;
 
-                    let _name = child.id().to_string();
+        let wait_status = child.try_wait().map_err(|err| {
+            error!("Error while wait on child {}: {}", child.id(), err);
+            tonic::Status::internal("Error while wait on specified job")
+        })?;
 
-                    job_executor::StatusResponse {
-                        // TODO: remove from map?
-                        name: stdout_buffer,
-                        state: status.to_string(),
-                    }
-                }
-                Ok(None) => job_executor::StatusResponse {
-                    name: child.id().to_string(),
-                    state: "Running".to_string(),
-                },
-                Err(e) => {
-                    error!("Error while wait on child {}: {}", child.id(), e);
-                    return Err(tonic::Status::internal("Error while wait on child"));
-                }
+        let reply = if let Some(status) = wait_status {
+            let mut stdout = child.stdout.take().unwrap(); // will consume it
+                                                           // TODO stderr
+            let mut stdout_buffer = String::new();
+            stdout.read_to_string(&mut stdout_buffer)?;
+
+            let _name = child.id().to_string(); // TODO actual name
+
+            drop(child);
+            // on success: remove from store - !!! Remove inner mutex, explore removing and reinserting the child
+            child_storage.remove(&pid);
+
+            job_executor::StatusResponse {
+                name: stdout_buffer, // FIXME
+                state: status.to_string(),
             }
         } else {
-            // FIXME make consistent
-            let sys = sysinfo::System::new_with_specifics(RefreshKind::new().with_processes());
-            let p = sys
-                .process(pid as sysinfo::Pid)
-                .ok_or(tonic::Status::not_found("Process not found"))?;
             job_executor::StatusResponse {
-                name: p.name().to_string(),
-                state: p.status().to_string(),
+                name: child.id().to_string(),
+                state: "Running".to_string(),
             }
         };
+
         Ok(Response::new(reply))
     }
 
@@ -118,17 +117,27 @@ impl JobExecutor for MyJobExecutor {
             .into_inner()
             .id
             .ok_or(tonic::Status::invalid_argument("No executionId provided"))?
-            .id as sysinfo::Pid; // https://github.com/GuillaumeGomez/sysinfo/issues/379
+            .id;
 
-        let sys = sysinfo::System::new_with_specifics(RefreshKind::new().with_processes());
-        let p = sys
-            .process(pid)
-            .ok_or(tonic::Status::not_found("Process not found"))?;
+        // Try to get child process from child_storage
+        let mut child_storage = self.child_storage.lock().unwrap();
+        let mut child = child_storage
+            .get(&pid)
+            .ok_or(tonic::Status::not_found("Cannot find job"))?
+            .lock()
+            .map_err(|err| {
+                error!("Mutex acquiring failed - {}", err);
+                tonic::Status::internal("Mutex acquiring failed")
+            })?;
 
-        let success = p.kill(Signal::Kill);
-
-        let reply = job_executor::StopResponse { success };
-        Ok(Response::new(reply))
+        child.kill().map_err(|err| {
+            error!("Error while wait on child {}: {}", child.id(), err);
+            tonic::Status::internal("Error while killing the job")
+        })?;
+        drop(child);
+        // on success: remove from store - !!! Remove inner mutex, explore removing and reinserting the child
+        child_storage.remove(&pid);
+        Ok(Response::new(job_executor::StopResponse {}))
     }
 }
 
