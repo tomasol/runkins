@@ -37,6 +37,8 @@ message StatusRequest {
 
 message StatusResponse {
     string name = 1;
-    string state = 2; // TODO enum
+    string state = 2; // Running or ExitStatus.to_string()
+    string stdout = 3;
+    string stderr = 4;
     // TODO add memory etc?
 }
