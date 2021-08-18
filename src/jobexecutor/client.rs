@@ -8,7 +8,7 @@ pub mod job_executor {
 }
 
 #[derive(StructOpt, Debug)]
-#[structopt(about = "the stupid content tracker")]
+#[structopt(about = "Job executor CLI")]
 enum Subcommand {
     Start {
         #[structopt(short, long)]

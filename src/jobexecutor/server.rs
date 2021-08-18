@@ -1,5 +1,3 @@
-#![feature(map_try_insert)]
-
 use log::*;
 use rand::prelude::*;
 use std::collections::hash_map::OccupiedError;
@@ -67,7 +65,7 @@ impl JobExecutor for MyJobExecutor {
         debug!("Request: {:?}", request);
         let start_req = request.into_inner();
 
-        let mut child = Command::new(start_req.path)
+        let child = Command::new(start_req.path)
             .args(start_req.args)
             .current_dir("/") // TODO: make configurable
             // TODO add ability to control env.vars
@@ -80,22 +78,18 @@ impl JobExecutor for MyJobExecutor {
                 tonic::Status::internal(format!("Cannot run command - {}", err))
                 // TODO add tracing id
             })?;
-        let mut pid;
-        loop {
-            // generate new pid
-            pid = thread_rng().gen();
-            match self
-                .child_storage
-                .lock()
-                .await
-                .try_insert(pid, ChildInfo::new(child, pid))
-            {
-                Ok(_) => break,
-                Err(OccupiedError { entry: _, value }) => {
-                    child = value.into();
-                }
+
+        // obtain lock
+        let mut store = self.child_storage.lock().await;
+        let pid: u32 = loop {
+            let random = thread_rng().gen();
+            if !store.contains_key(&random) {
+                break random;
             }
-        }
+        };
+        // remove nightly
+        store.insert(pid, ChildInfo::new(child, pid));
+
         debug!("Assigned pid {} to child process", pid); // TODO Tracing ID
         Ok(Response::new(StartResponse {
             id: Some(ExecutionId { id: pid }),
