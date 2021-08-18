@@ -1,13 +1,14 @@
 use log::*;
 use rand::prelude::*;
-use std::collections::hash_map::OccupiedError;
 use std::collections::HashMap;
 use std::process::Stdio;
 use tokio::io::AsyncBufReadExt;
-use tokio::io::AsyncReadExt;
 use tokio::io::BufReader;
+use tokio::process::ChildStdout;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -23,18 +24,147 @@ pub mod job_executor {
 
 #[derive(Debug, Default)]
 pub struct MyJobExecutor {
-    child_storage: Mutex<HashMap<u32, ChildInfo>>,
+    child_storage: Mutex<HashMap<u32, ChildInfo>>, // TODO performance: replace with concurrent hash map
 }
 
 #[derive(Debug)]
 struct ChildInfo {
     pid: u32,
     child: Child,
+    actor_tx: UnboundedSender<ActorEvent>,
+}
+
+type ClientTx = UnboundedSender<Result<OutputResponse, tonic::Status>>;
+
+#[derive(Debug)]
+enum ActorEvent {
+    StdOutLine(String),
+    ClientAdded(ClientTx),
 }
 
 impl ChildInfo {
-    fn new(child: Child, pid: u32) -> Self {
-        ChildInfo { child, pid }
+    pub fn add_client(&self, client_tx: ClientTx) -> Result<(), tonic::Status> {
+        self.actor_tx
+            .send(ActorEvent::ClientAdded(client_tx))
+            .map_err(|err| {
+                error!("[{}] Cannot add_client: {}", self.pid, err);
+                tonic::Status::internal("Cannot subscribe")
+            })
+    }
+
+    async fn stdout_reader(pid: u32, stdout: ChildStdout, tx: UnboundedSender<ActorEvent>) {
+        debug!("[{}] stdout_reader started", pid);
+        let mut buf_stdout = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match buf_stdout.read_line(&mut line).await {
+                Ok(0) => {
+                    debug!("[{}] stdout_reader is done reading", pid);
+                    break;
+                }
+                Ok(_) => {
+                    // append line
+                    debug!("[{}] stdout_reader got line - {}", pid, line);
+                    let send_result = tx.send(ActorEvent::StdOutLine(line));
+                    if let Err(err) = send_result {
+                        // rx closed or dropped, quit
+                        info!("[{}] stdout_reader - Cannot send the line: {}", pid, err);
+                        break;
+                    }
+                }
+                Err(err) => {
+                    error!("[{}] stdout_reader - Error in read_line: {}", pid, err);
+                    // TODO kill the process?
+                    break;
+                }
+            }
+        }
+        debug!("[{}] stdout_reader finished", pid);
+        // let _ = tx.send(ActorEvent::StdOutFinished); // ignore error when the actor channel is already closed
+    }
+
+    async fn actor(pid: u32, mut rx: UnboundedReceiver<ActorEvent>) {
+        debug!("[{}] actor started", pid);
+        let mut lines: Vec<String> = vec![];
+        let mut clients: Vec<ClientTx> = vec![];
+        while let Some(event) = rx.recv().await {
+            debug!("[{}] actor got = {:?}", pid, event);
+            match event {
+                ActorEvent::StdOutLine(line) => {
+                    lines.push(line.clone());
+                    // notify all clients
+                    clients.retain(|client_tx| {
+                        let res = ChildInfo::send_line(client_tx, &line);
+                        if let Err(()) = res {
+                            info!("[{}] Removing client {:?}", pid, client_tx); // TODO better id of client
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
+                ActorEvent::ClientAdded(client_tx) => {
+                    let send_result = ChildInfo::send_everything(&client_tx, &lines);
+                    if let Ok(()) = send_result {
+                        // add to clients
+                        clients.push(client_tx);
+                    } else {
+                        info!(
+                            "[{}] Not adding the client {:?}, error while replaying the output",
+                            pid, client_tx
+                        );
+                        // TODO test that in this state the RPC finished
+                    }
+                }
+            }
+        }
+
+        debug!("[{}] actor finished", pid);
+    }
+
+    // send everything to this client. This might be a bottleneck if many clients start connecting.
+    fn send_everything(client_tx: &ClientTx, lines: &Vec<String>) -> Result<(), ()> {
+        for line in lines {
+            ChildInfo::send_line(client_tx, line)?;
+        }
+        Ok(())
+    }
+
+    fn send_line(client_tx: &ClientTx, line: &str) -> Result<(), ()> {
+        client_tx
+            .send(Ok(ChildInfo::construct_output_response(line.to_string())))
+            .map_err(|_| ())?;
+        Ok(())
+    }
+
+    fn construct_output_response(stdout: String) -> OutputResponse {
+        OutputResponse {
+            std_out_chunk: Some(OutputChunk { chunk: stdout }),
+            std_err_chunk: None,
+        }
+    }
+
+    pub fn new(mut child: Child, pid: u32) -> Result<Self, tonic::Status> {
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or(tonic::Status::internal("Cannot take stdout"))?;
+        let (tx, rx) = mpsc::unbounded_channel();
+        let actor_tx = tx.clone();
+
+        tokio::spawn(async move {
+            ChildInfo::actor(pid, rx).await;
+        });
+
+        tokio::spawn(async move {
+            ChildInfo::stdout_reader(pid, stdout, tx).await;
+        });
+
+        Ok(ChildInfo {
+            child,
+            pid,
+            actor_tx,
+        })
     }
 
     fn status(&mut self) -> Result<String, tonic::Status> {
@@ -67,7 +197,7 @@ impl JobExecutor for MyJobExecutor {
 
         let child = Command::new(start_req.path)
             .args(start_req.args)
-            .current_dir("/") // TODO: make configurable
+            .current_dir(".") // TODO: make configurable
             // TODO add ability to control env.vars
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -88,7 +218,7 @@ impl JobExecutor for MyJobExecutor {
             }
         };
         // remove nightly
-        store.insert(pid, ChildInfo::new(child, pid));
+        store.insert(pid, ChildInfo::new(child, pid)?);
 
         debug!("Assigned pid {} to child process", pid); // TODO Tracing ID
         Ok(Response::new(StartResponse {
@@ -112,10 +242,10 @@ impl JobExecutor for MyJobExecutor {
         let mut child_info = child_storage
             .remove(&pid)
             .ok_or(tonic::Status::not_found("Cannot find job"))?;
-
-        Ok(Response::new(job_executor::StatusResponse {
-            state: child_info.status()?,
-        }))
+        let state = child_info.status()?;
+        // reinsert
+        child_storage.insert(pid, child_info); // FIXME: make status() imutable
+        Ok(Response::new(job_executor::StatusResponse { state }))
     }
 
     async fn stop(
@@ -149,19 +279,20 @@ impl JobExecutor for MyJobExecutor {
         request: tonic::Request<job_executor::OutputRequest>,
     ) -> Result<tonic::Response<Self::GetOutputStream>, tonic::Status> {
         debug!("Request: {:?}", request);
+        let pid = request
+            .into_inner()
+            .id
+            .ok_or(tonic::Status::invalid_argument("No executionId provided"))?
+            .id;
+
+        // Try to get child process from child_storage
+        let child_storage = self.child_storage.lock().await;
+        let child_info = child_storage
+            .get(&pid)
+            .ok_or(tonic::Status::not_found("Cannot find job"))?;
+
         let (tx, rx) = mpsc::unbounded_channel();
-
-        tokio::spawn(async move {
-            let msg: OutputResponse = OutputResponse {
-                std_out_chunk: Some(OutputChunk {
-                    chunk: "out".to_string(),
-                }),
-                std_err_chunk: None,
-            };
-            tx.send(Ok(msg)).unwrap();
-
-            println!(" /// done sending");
-        });
+        child_info.add_client(tx)?;
 
         Ok(Response::new(UnboundedReceiverStream::new(rx)))
     }

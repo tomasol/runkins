@@ -27,6 +27,10 @@ path = "src/jobexecutor/server.rs"
 name = "jobexecutor-client"
 path = "src/jobexecutor/client.rs"
 
+[[bin]]
+name = "slow"
+path = "src/slowprocess/slow.rs"
+
 [dependencies]
 anyhow = "1.0.42"
 async-stream = "0.3"

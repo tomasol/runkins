@@ -19,7 +19,7 @@ NO: limits, authorization etc.
 * Should exitted child process be kept around until State/Stop RPC is called (once)?
 
 ### Security
-* Use a simple authorization scheme.
+* Use a simple authorization scheme. DoS prevention - limits for RPCs per user
 
 ### Streaming
 * Should stdout,err automatically be buffered or waited until stream RPC is called?
