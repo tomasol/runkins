@@ -10,6 +10,7 @@ use tokio::io::AsyncReadExt;
 use tokio::io::BufReader;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use anyhow::Context;
 use tonic::{transport::Server, Response};
@@ -23,10 +24,38 @@ pub mod job_executor {
 
 #[derive(Debug, Default)]
 pub struct MyJobExecutor {
-    child_storage: Mutex<HashMap<u32, Child>>,
+    child_storage: Mutex<HashMap<u32, ChildInfo>>,
 }
 
-// TODO: consider using tokio mutex
+#[derive(Debug)]
+struct ChildInfo {
+    pid: u32,
+    child: Child,
+}
+
+impl ChildInfo {
+    fn new(child: Child, pid: u32) -> ChildInfo {
+        ChildInfo { child, pid }
+    }
+
+    fn status(&mut self) -> Result<String, tonic::Status> {
+        // FIXME error type
+        match self.child.try_wait() {
+            Ok(Some(exit_status)) => Ok(exit_status.to_string()),
+            Ok(None) => Ok("Running".to_string()),
+            Err(err) => {
+                error!("Child process {} got error on try_wait: {}", self.pid, err);
+                Err(tonic::Status::internal("Error while wait on specified job"))
+            }
+        }
+    }
+}
+
+impl Into<Child> for ChildInfo {
+    fn into(self) -> Child {
+        self.child
+    }
+}
 
 #[tonic::async_trait]
 impl JobExecutor for MyJobExecutor {
@@ -54,10 +83,15 @@ impl JobExecutor for MyJobExecutor {
         loop {
             // generate new pid
             pid = thread_rng().gen();
-            match self.child_storage.lock().await.try_insert(pid, child) {
+            match self
+                .child_storage
+                .lock()
+                .await
+                .try_insert(pid, ChildInfo::new(child, pid))
+            {
                 Ok(_) => break,
                 Err(OccupiedError { entry: _, value }) => {
-                    child = value;
+                    child = value.into();
                 }
             }
         }
@@ -80,58 +114,13 @@ impl JobExecutor for MyJobExecutor {
 
         // Try to get child process from child_storage
         let mut child_storage = self.child_storage.lock().await;
-        let mut child = child_storage
+        let mut child_info = child_storage
             .remove(&pid)
             .ok_or(tonic::Status::not_found("Cannot find job"))?;
 
-        let wait_status = child.try_wait().map_err(|err| {
-            error!("Error while wait on child {}: {}", pid, err);
-            // child will be dropped
-            tonic::Status::internal("Error while wait on specified job")
-        })?;
-        let name = pid.to_string(); // TODO actual name
-
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or(tonic::Status::internal("Cannot read stdout"))?;
-
-        let mut buf_stdout = BufReader::new(stdout);
-        let mut stdout_buffer = String::new();
-
-        buf_stdout.read_line(&mut stdout_buffer).await.unwrap();
-
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or(tonic::Status::internal("Cannot read stderr"))?;
-        let mut buf_stderr = BufReader::new(stderr);
-        let mut stderr_buffer = String::new();
-        buf_stderr.read_line(&mut stderr_buffer).await.unwrap();
-
-        child.stderr = Some(buf_stderr.into_inner());
-
-        let reply = if let Some(exit_status) = wait_status {
-            job_executor::StatusResponse {
-                name,
-                state: exit_status.to_string(),
-                stdout: stdout_buffer,
-                stderr: stderr_buffer,
-            }
-        } else {
-            // put it back for future, might not be needed
-            child.stdout = Some(buf_stdout.into_inner());
-            // reinsert child to child_storage
-            child_storage.insert(pid, child);
-            job_executor::StatusResponse {
-                name,
-                state: "Running".to_string(),
-                stdout: stdout_buffer,
-                stderr: stderr_buffer,
-            }
-        };
-
-        Ok(Response::new(reply))
+        Ok(Response::new(job_executor::StatusResponse {
+            state: child_info.status()?,
+        }))
     }
 
     async fn stop(
@@ -147,15 +136,24 @@ impl JobExecutor for MyJobExecutor {
 
         // Try to get child process from child_storage
         let mut child_storage = self.child_storage.lock().await;
-        let mut child = child_storage
+        let mut child_info = child_storage
             .remove(&pid)
             .ok_or(tonic::Status::not_found("Cannot find job"))?;
 
-        child.kill().await.map_err(|err| {
+        child_info.child.kill().await.map_err(|err| {
             error!("Error while wait on child {}: {}", pid, err);
             tonic::Status::internal("Error while killing the job")
         })?;
         Ok(Response::new(job_executor::StopResponse {}))
+    }
+
+    type GetOutputStream = UnboundedReceiverStream<Result<OutputResponse, tonic::Status>>;
+
+    async fn get_output(
+        &self,
+        request: tonic::Request<job_executor::OutputRequest>,
+    ) -> Result<tonic::Response<Self::GetOutputStream>, tonic::Status> {
+        todo!()
     }
 }
 

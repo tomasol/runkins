@@ -6,7 +6,7 @@ service JobExecutor {
     rpc Start(StartRequest) returns (StartResponse) {}
     rpc Stop(StopRequest) returns (StopResponse) {}
     rpc JobStatus(StatusRequest) returns (StatusResponse) {}
-    // TODO rpc VmStatus() health check, load averages, physical,logical cores etc for monitoring
+    rpc GetOutput(OutputRequest) returns (stream OutputResponse) {}
 }
 
 message ExecutionId {
@@ -16,12 +16,11 @@ message ExecutionId {
 message StartRequest {
   string path = 1;
   repeated string args = 2;
-  // TODO env vars
 }
 
 message StartResponse {
     ExecutionId id = 1;
-    // TODO maybe add details about free/used resources, load avgs etc?
+    // TODO add cgroup limits
 }
 
 message StopRequest {
@@ -36,9 +35,19 @@ message StatusRequest {
 }
 
 message StatusResponse {
-    string name = 1;
-    string state = 2; // Running or ExitStatus.to_string()
-    string stdout = 3;
-    string stderr = 4;
-    // TODO add memory etc?
+    string state = 2; // "Running" or ExitStatus.to_string()
+}
+
+message OutputRequest {
+    ExecutionId id = 1;
+}
+
+message OutputChunk {
+    string chunk = 1;
+    // TODO timestamp
+}
+
+message OutputResponse {
+    OutputChunk stdOutChunk = 1;
+    OutputChunk stdErrChunk = 2;
 }

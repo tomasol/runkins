@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use futures::{Stream, StreamExt};
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
@@ -37,7 +37,7 @@ impl RouteGuide for RouteGuideService {
         Ok(Response::new(Feature::default()))
     }
 
-    type ListFeaturesStream = ReceiverStream<Result<Feature, Status>>;
+    type ListFeaturesStream = UnboundedReceiverStream<Result<Feature, Status>>;
 
     async fn list_features(
         &self,
@@ -45,21 +45,21 @@ impl RouteGuide for RouteGuideService {
     ) -> Result<Response<Self::ListFeaturesStream>, Status> {
         println!("ListFeatures = {:?}", request);
 
-        let (tx, rx) = mpsc::channel(4);
+        let (tx, rx) = mpsc::unbounded_channel();
         let features = self.features.clone();
 
         tokio::spawn(async move {
             for feature in &features[..] {
                 if in_range(feature.location.as_ref().unwrap(), request.get_ref()) {
                     println!("  => send {:?}", feature);
-                    tx.send(Ok(feature.clone())).await.unwrap();
+                    tx.send(Ok(feature.clone())).unwrap();
                 }
             }
 
             println!(" /// done sending");
         });
 
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(Response::new(UnboundedReceiverStream::new(rx)))
     }
 
     async fn record_route(
