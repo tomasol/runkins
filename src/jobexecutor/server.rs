@@ -9,6 +9,7 @@ use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncReadExt;
 use tokio::io::BufReader;
 use tokio::process::{Child, Command};
+use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -34,7 +35,7 @@ struct ChildInfo {
 }
 
 impl ChildInfo {
-    fn new(child: Child, pid: u32) -> ChildInfo {
+    fn new(child: Child, pid: u32) -> Self {
         ChildInfo { child, pid }
     }
 
@@ -63,7 +64,7 @@ impl JobExecutor for MyJobExecutor {
         &self,
         request: tonic::Request<job_executor::StartRequest>,
     ) -> Result<tonic::Response<job_executor::StartResponse>, tonic::Status> {
-        debug!("Got a request: {:?}", request);
+        debug!("Request: {:?}", request);
         let start_req = request.into_inner();
 
         let mut child = Command::new(start_req.path)
@@ -105,7 +106,7 @@ impl JobExecutor for MyJobExecutor {
         &self,
         request: tonic::Request<job_executor::StatusRequest>,
     ) -> Result<tonic::Response<job_executor::StatusResponse>, tonic::Status> {
-        debug!("Got a request: {:?}", request);
+        debug!("Request: {:?}", request);
         let pid = request
             .into_inner()
             .id
@@ -127,7 +128,7 @@ impl JobExecutor for MyJobExecutor {
         &self,
         request: tonic::Request<job_executor::StopRequest>,
     ) -> Result<tonic::Response<job_executor::StopResponse>, tonic::Status> {
-        debug!("Got a request: {:?}", request);
+        debug!("Request: {:?}", request);
         let pid = request
             .into_inner()
             .id
@@ -153,7 +154,22 @@ impl JobExecutor for MyJobExecutor {
         &self,
         request: tonic::Request<job_executor::OutputRequest>,
     ) -> Result<tonic::Response<Self::GetOutputStream>, tonic::Status> {
-        todo!()
+        debug!("Request: {:?}", request);
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        tokio::spawn(async move {
+            let msg: OutputResponse = OutputResponse {
+                std_out_chunk: Some(OutputChunk {
+                    chunk: "out".to_string(),
+                }),
+                std_err_chunk: None,
+            };
+            tx.send(Ok(msg)).unwrap();
+
+            println!(" /// done sending");
+        });
+
+        Ok(Response::new(UnboundedReceiverStream::new(rx)))
     }
 }
 

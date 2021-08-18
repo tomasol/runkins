@@ -22,6 +22,9 @@ enum Subcommand {
     Stop {
         pid: u32,
     },
+    GetOutput {
+        pid: u32,
+    },
 }
 
 #[tokio::main]
@@ -58,6 +61,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             debug!("Request=${:?}", request);
             let response = client.stop(request).await?;
             info!("Response={:?}", response);
+        }
+        Subcommand::GetOutput { pid } => {
+            let request = tonic::Request::new(OutputRequest {
+                id: Some(ExecutionId { id: pid }),
+            });
+            debug!("Request=${:?}", request);
+            let mut stream = client.get_output(request).await?.into_inner();
+
+            while let Some(chunk) = stream.message().await? {
+                println!("chunk = {:?}", chunk);
+            }
         }
     };
     Ok(())
