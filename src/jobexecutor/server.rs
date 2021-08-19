@@ -148,7 +148,7 @@ impl ChildInfo {
     }
 
     // send everything to this client. This might be a bottleneck if many clients start connecting.
-    fn send_everything(client_tx: &ClientTx, lines: &Vec<String>) -> Result<(), ()> {
+    fn send_everything(client_tx: &ClientTx, lines: &[String]) -> Result<(), ()> {
         for line in lines {
             ChildInfo::send_line(client_tx, line)?;
         }
@@ -173,7 +173,7 @@ impl ChildInfo {
         let stdout = child
             .stdout
             .take()
-            .ok_or(tonic::Status::internal("Cannot take stdout"))?;
+            .ok_or_else(|| tonic::Status::internal("Cannot take stdout"))?;
         let (tx, rx) = mpsc::unbounded_channel();
         let actor_tx = tx.clone();
 
@@ -254,19 +254,19 @@ impl JobExecutor for MyJobExecutor {
         let pid = request
             .into_inner()
             .id
-            .ok_or(tonic::Status::invalid_argument("No executionId provided"))?
+            .ok_or_else(|| tonic::Status::invalid_argument("No executionId provided"))?
             .id;
 
         // Try to get child process from child_storage
         let child_storage = self.child_storage.lock().await;
         let child_info = child_storage
             .get(&pid)
-            .ok_or(tonic::Status::not_found("Cannot find job"))?;
+            .ok_or_else(|| tonic::Status::not_found("Cannot find job"))?;
         let state = child_info
             .status()
             .await?
             .map(|s| s.to_string())
-            .unwrap_or("Running".to_string());
+            .unwrap_or_else(|| "Running".to_string());
         Ok(Response::new(job_executor::StatusResponse { state }))
     }
 
@@ -279,14 +279,14 @@ impl JobExecutor for MyJobExecutor {
         let remove = inner_request.remove;
         let pid = inner_request
             .id
-            .ok_or(tonic::Status::invalid_argument("No executionId provided"))?
+            .ok_or_else(|| tonic::Status::invalid_argument("No executionId provided"))?
             .id;
 
         // Try to get child process from child_storage
         let mut child_storage = self.child_storage.lock().await;
         let child_info = child_storage
             .get(&pid)
-            .ok_or(tonic::Status::not_found("Cannot find job"))?;
+            .ok_or_else(|| tonic::Status::not_found("Cannot find job"))?;
 
         child_info.kill().await?;
         if remove {
@@ -305,14 +305,14 @@ impl JobExecutor for MyJobExecutor {
         let pid = request
             .into_inner()
             .id
-            .ok_or(tonic::Status::invalid_argument("No executionId provided"))?
+            .ok_or_else(|| tonic::Status::invalid_argument("No executionId provided"))?
             .id;
 
         // Try to get child process from child_storage
         let child_storage = self.child_storage.lock().await;
         let child_info = child_storage
             .get(&pid)
-            .ok_or(tonic::Status::not_found("Cannot find job"))?;
+            .ok_or_else(|| tonic::Status::not_found("Cannot find job"))?;
 
         let (tx, rx) = mpsc::unbounded_channel();
         child_info.add_client(tx)?;
@@ -328,14 +328,14 @@ impl JobExecutor for MyJobExecutor {
         let pid = request
             .into_inner()
             .id
-            .ok_or(tonic::Status::invalid_argument("No executionId provided"))?
+            .ok_or_else(|| tonic::Status::invalid_argument("No executionId provided"))?
             .id;
 
         // Try to get child process from child_storage
         let mut child_storage = self.child_storage.lock().await;
         let child_info = child_storage
             .get(&pid)
-            .ok_or(tonic::Status::not_found("Cannot find job"))?;
+            .ok_or_else(|| tonic::Status::not_found("Cannot find job"))?;
 
         // Only allow removing finished processes
         match child_info.status().await {
