@@ -4,22 +4,6 @@ name = "rusty-jenkins"
 version = "0.1.0"
 
 [[bin]]
-name = "helloworld-server"
-path = "src/helloworld/server.rs"
-
-[[bin]]
-name = "helloworld-client"
-path = "src/helloworld/client.rs"
-
-[[bin]]
-name = "routeguide-server"
-path = "src/routeguide/server.rs"
-
-[[bin]]
-name = "routeguide-client"
-path = "src/routeguide/client.rs"
-
-[[bin]]
 name = "jobexecutor-server"
 path = "src/jobexecutor/server.rs"
 
