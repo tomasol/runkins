@@ -3,10 +3,11 @@ syntax = "proto3";
 package jobexecutor;
 
 service JobExecutor {
-    rpc Start(StartRequest) returns (StartResponse) {}
-    rpc Stop(StopRequest) returns (StopResponse) {}
-    rpc JobStatus(StatusRequest) returns (StatusResponse) {}
-    rpc GetOutput(OutputRequest) returns (stream OutputResponse) {}
+    rpc Start(StartRequest) returns (StartResponse);
+    rpc Stop(StopRequest) returns (StopResponse);
+    rpc JobStatus(StatusRequest) returns (StatusResponse);
+    rpc GetOutput(OutputRequest) returns (stream OutputResponse);
+    rpc Remove(RemoveRequest) returns (RemoveResponse);
 }
 
 message ExecutionId {
@@ -25,6 +26,7 @@ message StartResponse {
 
 message StopRequest {
     ExecutionId id = 1;
+    bool remove = 2;
 }
 
 message StopResponse {
@@ -48,6 +50,14 @@ message OutputChunk {
 }
 
 message OutputResponse {
-    OutputChunk stdOutChunk = 1;
-    OutputChunk stdErrChunk = 2;
+    OutputChunk std_out_chunk = 1;
+    OutputChunk std_err_chunk = 2;
+}
+
+message RemoveRequest {
+    ExecutionId id = 1;
+}
+
+message RemoveResponse {
+    
 }

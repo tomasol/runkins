@@ -11,7 +11,7 @@ pub mod job_executor {
 #[structopt(about = "Job executor CLI")]
 enum Subcommand {
     Start {
-        #[structopt(short, long)]
+        // #[structopt(short, long)]
         path: String,
         #[structopt()]
         args: Vec<String>,
@@ -20,9 +20,14 @@ enum Subcommand {
         pid: u32,
     },
     Stop {
+        #[structopt(short, long)]
+        remove: bool,
         pid: u32,
     },
-    GetOutput {
+    Output {
+        pid: u32,
+    },
+    Remove {
         pid: u32,
     },
 }
@@ -54,15 +59,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let response = client.job_status(request).await?;
             info!("Response={:?}", response);
         }
-        Subcommand::Stop { pid } => {
+        Subcommand::Stop { pid, remove } => {
             let request = tonic::Request::new(StopRequest {
                 id: Some(ExecutionId { id: pid }),
+                remove,
             });
             debug!("Request=${:?}", request);
             let response = client.stop(request).await?;
             info!("Response={:?}", response);
         }
-        Subcommand::GetOutput { pid } => {
+        Subcommand::Output { pid } => {
             let request = tonic::Request::new(OutputRequest {
                 id: Some(ExecutionId { id: pid }),
             });
@@ -72,6 +78,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             while let Some(chunk) = stream.message().await? {
                 println!("chunk = {:?}", chunk);
             }
+        }
+        Subcommand::Remove { pid } => {
+            let request = tonic::Request::new(RemoveRequest {
+                id: Some(ExecutionId { id: pid }),
+            });
+            debug!("Request=${:?}", request);
+            let response = client.remove(request).await?;
+            info!("Response={:?}", response);
         }
     };
     Ok(())

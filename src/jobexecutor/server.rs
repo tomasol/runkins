@@ -252,8 +252,9 @@ impl JobExecutor for MyJobExecutor {
         request: tonic::Request<job_executor::StopRequest>,
     ) -> Result<tonic::Response<job_executor::StopResponse>, tonic::Status> {
         debug!("Request: {:?}", request);
-        let pid = request
-            .into_inner()
+        let inner_request = request.into_inner();
+        let remove = inner_request.remove;
+        let pid = inner_request
             .id
             .ok_or(tonic::Status::invalid_argument("No executionId provided"))?
             .id;
@@ -261,10 +262,13 @@ impl JobExecutor for MyJobExecutor {
         // Try to get child process from child_storage
         let mut child_storage = self.child_storage.lock().await;
         let child_info = child_storage
-            .remove(&pid)
+            .get(&pid)
             .ok_or(tonic::Status::not_found("Cannot find job"))?;
 
         child_info.kill().await?;
+        if remove {
+            child_storage.remove(&pid);
+        }
         Ok(Response::new(job_executor::StopResponse {}))
     }
 
@@ -291,6 +295,25 @@ impl JobExecutor for MyJobExecutor {
         child_info.add_client(tx)?;
 
         Ok(Response::new(UnboundedReceiverStream::new(rx)))
+    }
+
+    async fn remove(
+        &self,
+        request: tonic::Request<job_executor::RemoveRequest>,
+    ) -> Result<tonic::Response<job_executor::RemoveResponse>, tonic::Status> {
+        debug!("Request: {:?}", request);
+        let pid = request
+            .into_inner()
+            .id
+            .ok_or(tonic::Status::invalid_argument("No executionId provided"))?
+            .id;
+
+        // Try to get child process from child_storage
+        let mut child_storage = self.child_storage.lock().await;
+        child_storage
+            .remove(&pid)
+            .ok_or(tonic::Status::not_found("Cannot find job"))?;
+        Ok(Response::new(RemoveResponse {}))
     }
 }
 
