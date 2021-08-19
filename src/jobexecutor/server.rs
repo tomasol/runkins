@@ -1,6 +1,7 @@
 use log::*;
 use rand::prelude::*;
 use std::collections::HashMap;
+use std::process::ExitStatus;
 use std::process::Stdio;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
@@ -191,15 +192,11 @@ impl ChildInfo {
         })
     }
 
-    pub async fn status(&self) -> Result<String, tonic::Status> {
-        match self.child.lock().await.try_wait() {
-            Ok(Some(exit_status)) => Ok(exit_status.to_string()),
-            Ok(None) => Ok("Running".to_string()),
-            Err(err) => {
-                error!("Child process {} got error on try_wait: {}", self.pid, err);
-                Err(tonic::Status::internal("Error while wait on specified job"))
-            }
-        }
+    pub async fn status(&self) -> Result<Option<ExitStatus>, tonic::Status> {
+        self.child.lock().await.try_wait().map_err(|err| {
+            error!("Child process {} got error on try_wait: {}", self.pid, err);
+            tonic::Status::internal("Error while getting the job status")
+        })
     }
 
     pub async fn kill(&self) -> Result<(), tonic::Status> {
@@ -265,7 +262,11 @@ impl JobExecutor for MyJobExecutor {
         let child_info = child_storage
             .get(&pid)
             .ok_or(tonic::Status::not_found("Cannot find job"))?;
-        let state = child_info.status().await?;
+        let state = child_info
+            .status()
+            .await?
+            .map(|s| s.to_string())
+            .unwrap_or("Running".to_string());
         Ok(Response::new(job_executor::StatusResponse { state }))
     }
 
@@ -332,9 +333,31 @@ impl JobExecutor for MyJobExecutor {
 
         // Try to get child process from child_storage
         let mut child_storage = self.child_storage.lock().await;
-        child_storage
-            .remove(&pid)
+        let child_info = child_storage
+            .get(&pid)
             .ok_or(tonic::Status::not_found("Cannot find job"))?;
+
+        // Only allow removing finished processes
+        match child_info.status().await {
+            Ok(Some(_)) => {
+                let removed = child_storage.remove(&pid);
+                assert!(
+                    removed.is_some(),
+                    "HashMap contais a job that cannot be removed" // this should never happen
+                );
+                Ok(())
+            }
+            Ok(None) => {
+                // still running, fail
+                Err(tonic::Status::failed_precondition("Job is still running"))
+            }
+            Err(err) => {
+                error!("[{}] Cannot get job status, not removing - {}", pid, err);
+                Err(tonic::Status::internal(
+                    "Cannot get job status, not removing",
+                ))
+            }
+        }?;
         Ok(Response::new(RemoveResponse {}))
     }
 }
