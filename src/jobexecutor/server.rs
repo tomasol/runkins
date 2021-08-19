@@ -40,6 +40,7 @@ type ClientTx = UnboundedSender<Result<OutputResponse, tonic::Status>>;
 enum ActorEvent {
     StdOutLine(String),
     ClientAdded(ClientTx),
+    StdOutFinished,
 }
 
 impl ChildInfo {
@@ -57,6 +58,7 @@ impl ChildInfo {
         let mut buf_stdout = BufReader::new(stdout);
         loop {
             let mut line = String::new();
+            // sending larger chunks than one line might increase performance
             match buf_stdout.read_line(&mut line).await {
                 Ok(0) => {
                     debug!("[{}] stdout_reader is done reading", pid);
@@ -80,17 +82,31 @@ impl ChildInfo {
             }
         }
         debug!("[{}] stdout_reader finished", pid);
-        // let _ = tx.send(ActorEvent::StdOutFinished); // ignore error when the actor channel is already closed
+        if let Err(err) = tx.send(ActorEvent::StdOutFinished) {
+            error!(
+                "[{}] stdout_reader could not send StdOutFinished - {}",
+                pid, err
+            );
+        }
     }
 
     async fn actor(pid: u32, mut rx: UnboundedReceiver<ActorEvent>) {
         debug!("[{}] actor started", pid);
         let mut lines: Vec<String> = vec![];
         let mut clients: Vec<ClientTx> = vec![];
+        let mut exited = false;
         while let Some(event) = rx.recv().await {
-            debug!("[{}] actor got = {:?}", pid, event);
+            debug!(
+                "[{}] actor event={:?}, lines={}, clients={}, exited={}",
+                pid,
+                event,
+                lines.len(),
+                clients.len(),
+                exited
+            );
             match event {
                 ActorEvent::StdOutLine(line) => {
+                    assert!(!exited, "Illegal state - StdOutLine after StdOutFinished");
                     lines.push(line.clone());
                     // notify all clients
                     clients.retain(|client_tx| {
@@ -102,12 +118,15 @@ impl ChildInfo {
                             true
                         }
                     });
+                    // TODO LOW: detect when client closes the connection without trying to write
                 }
                 ActorEvent::ClientAdded(client_tx) => {
                     let send_result = ChildInfo::send_everything(&client_tx, &lines);
                     if let Ok(()) = send_result {
-                        // add to clients
-                        clients.push(client_tx);
+                        if !exited {
+                            // add to clients
+                            clients.push(client_tx);
+                        } // otherwise drop client_tx which will disconnect the client
                     } else {
                         info!(
                             "[{}] Not adding the client {:?}, error while replaying the output",
@@ -115,6 +134,11 @@ impl ChildInfo {
                         );
                         // TODO test that in this state the RPC finished
                     }
+                }
+                ActorEvent::StdOutFinished => {
+                    exited = true;
+                    // disconnect all clients
+                    clients.clear();
                 }
             }
         }
