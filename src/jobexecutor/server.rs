@@ -30,7 +30,7 @@ pub struct MyJobExecutor {
 #[derive(Debug)]
 struct ChildInfo {
     pid: u32,
-    child: Child,
+    child: Mutex<Child>,
     actor_tx: UnboundedSender<ActorEvent>,
 }
 
@@ -161,15 +161,15 @@ impl ChildInfo {
         });
 
         Ok(ChildInfo {
-            child,
+            child: Mutex::new(child),
             pid,
             actor_tx,
         })
     }
 
-    fn status(&mut self) -> Result<String, tonic::Status> {
+    pub async fn status(&self) -> Result<String, tonic::Status> {
         // FIXME error type
-        match self.child.try_wait() {
+        match self.child.lock().await.try_wait() {
             Ok(Some(exit_status)) => Ok(exit_status.to_string()),
             Ok(None) => Ok("Running".to_string()),
             Err(err) => {
@@ -178,11 +178,12 @@ impl ChildInfo {
             }
         }
     }
-}
 
-impl Into<Child> for ChildInfo {
-    fn into(self) -> Child {
-        self.child
+    pub async fn kill(&self) -> Result<(), tonic::Status> {
+        self.child.lock().await.kill().await.map_err(|err| {
+            error!("[{}] Error while wait on child {}", self.pid, err);
+            tonic::Status::internal("Error while killing the job")
+        })
     }
 }
 
@@ -238,13 +239,11 @@ impl JobExecutor for MyJobExecutor {
             .id;
 
         // Try to get child process from child_storage
-        let mut child_storage = self.child_storage.lock().await;
-        let mut child_info = child_storage
-            .remove(&pid)
+        let child_storage = self.child_storage.lock().await;
+        let child_info = child_storage
+            .get(&pid)
             .ok_or(tonic::Status::not_found("Cannot find job"))?;
-        let state = child_info.status()?;
-        // reinsert
-        child_storage.insert(pid, child_info); // FIXME: make status() imutable
+        let state = child_info.status().await?;
         Ok(Response::new(job_executor::StatusResponse { state }))
     }
 
@@ -261,14 +260,11 @@ impl JobExecutor for MyJobExecutor {
 
         // Try to get child process from child_storage
         let mut child_storage = self.child_storage.lock().await;
-        let mut child_info = child_storage
+        let child_info = child_storage
             .remove(&pid)
             .ok_or(tonic::Status::not_found("Cannot find job"))?;
 
-        child_info.child.kill().await.map_err(|err| {
-            error!("Error while wait on child {}: {}", pid, err);
-            tonic::Status::internal("Error while killing the job")
-        })?;
+        child_info.kill().await?;
         Ok(Response::new(job_executor::StopResponse {}))
     }
 
