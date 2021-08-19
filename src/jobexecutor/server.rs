@@ -24,7 +24,7 @@ pub mod job_executor {
 
 #[derive(Debug, Default)]
 pub struct MyJobExecutor {
-    child_storage: Mutex<HashMap<u32, ChildInfo>>, // TODO performance: replace with concurrent hash map
+    child_storage: Mutex<HashMap<u32, ChildInfo>>,
 }
 
 #[derive(Debug)]
@@ -34,7 +34,7 @@ struct ChildInfo {
     actor_tx: UnboundedSender<ActorEvent>,
 }
 
-type ClientTx = UnboundedSender<Result<OutputResponse, tonic::Status>>;
+type ClientTx = UnboundedSender<Result<OutputResponse, tonic::Status>>; // consider adding Display trait for showing IP:port of client
 
 #[derive(Debug)]
 enum ActorEvent {
@@ -65,18 +65,18 @@ impl ChildInfo {
                     break;
                 }
                 Ok(_) => {
-                    // append line
+                    // send the line to the actor
                     debug!("[{}] stdout_reader got line - {}", pid, line);
                     let send_result = tx.send(ActorEvent::StdOutLine(line));
                     if let Err(err) = send_result {
-                        // rx closed or dropped, quit
+                        // rx closed or dropped, so actor died
                         info!("[{}] stdout_reader - Cannot send the line: {}", pid, err);
                         break;
                     }
                 }
                 Err(err) => {
                     error!("[{}] stdout_reader - Error in read_line: {}", pid, err);
-                    // TODO kill the process?
+                    // IO error or invalid UTF, consider recovery. For now just finish reading.
                     break;
                 }
             }
@@ -112,13 +112,13 @@ impl ChildInfo {
                     clients.retain(|client_tx| {
                         let res = ChildInfo::send_line(client_tx, &line);
                         if let Err(()) = res {
-                            info!("[{}] Removing client {:?}", pid, client_tx); // TODO better id of client
+                            info!("[{}] Removing client {:?}", pid, client_tx);
                             false
                         } else {
                             true
                         }
                     });
-                    // TODO LOW: detect when client closes the connection without trying to write
+                    // memory improvement: detect when client closes the connection and drop the handle
                 }
                 ActorEvent::ClientAdded(client_tx) => {
                     let send_result = ChildInfo::send_everything(&client_tx, &lines);
@@ -192,7 +192,6 @@ impl ChildInfo {
     }
 
     pub async fn status(&self) -> Result<String, tonic::Status> {
-        // FIXME error type
         match self.child.lock().await.try_wait() {
             Ok(Some(exit_status)) => Ok(exit_status.to_string()),
             Ok(None) => Ok("Running".to_string()),
@@ -222,8 +221,8 @@ impl JobExecutor for MyJobExecutor {
 
         let child = Command::new(start_req.path)
             .args(start_req.args)
-            .current_dir(".") // TODO: make configurable
-            // TODO add ability to control env.vars
+            .current_dir(".") // consider making this configurable
+            // consider adding ability to control env.vars
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -231,7 +230,7 @@ impl JobExecutor for MyJobExecutor {
             .context("Cannot run command")
             .map_err(|err| {
                 tonic::Status::internal(format!("Cannot run command - {}", err))
-                // TODO add tracing id
+                // consider adding tracing id
             })?;
 
         // obtain lock
@@ -242,10 +241,9 @@ impl JobExecutor for MyJobExecutor {
                 break random;
             }
         };
-        // remove nightly
         store.insert(pid, ChildInfo::new(child, pid)?);
 
-        debug!("Assigned pid {} to child process", pid); // TODO Tracing ID
+        debug!("Assigned pid {} to the child process", pid);
         Ok(Response::new(StartResponse {
             id: Some(ExecutionId { id: pid }),
         }))
