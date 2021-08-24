@@ -66,8 +66,6 @@ message StartResponse {
 
 message StopRequest {
     ExecutionId id = 1;
-    // Clean up all resources like stdout, stderr, status etc.
-    bool remove = 2;
 }
 
 message StopResponse {

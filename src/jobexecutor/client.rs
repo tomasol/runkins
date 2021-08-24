@@ -22,8 +22,6 @@ enum Subcommand {
         pid: PID,
     },
     Stop {
-        #[structopt(short, long)]
-        remove: bool,
         pid: PID,
     },
     Output {
@@ -65,10 +63,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let response = client.job_status(request).await?;
             info!("Response={:?}", response);
         }
-        Subcommand::Stop { pid, remove } => {
+        Subcommand::Stop { pid } => {
             let request = tonic::Request::new(StopRequest {
                 id: Some(ExecutionId { id: pid }),
-                remove,
             });
             debug!("Request=${:?}", request);
             let response = client.stop(request).await?;
