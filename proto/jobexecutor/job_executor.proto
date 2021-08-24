@@ -31,7 +31,9 @@ message CGroup {
 
 message MemoryLimit {
     // Memory usage hard limit. See "memory.max".
-    uint64 memory_max = 1;
+    optional uint64 memory_max = 1;
+    // Swap usage hard limit. See "memory.swap.max".
+    optional uint64 memory_swap_max = 2;
 }
 
 /*
@@ -47,10 +49,10 @@ message CpuLimit {
 
 message BlockDeviceLimit {
     // Block device limits. BPS and IOPS based IO limit. See "io.max".
-    uint64 io_max_rbps = 1; // Throttle the bytes per second rate of read operation affecting the block device
-    uint64 io_max_riops = 2;// Throttle the I/O operations per second rate of read operation affecting the block device
-    uint64 io_max_wbps = 3; // Throttle the bytes per second rate of write operation affecting the block device
-    uint64 io_max_wiops =4; // Throttle the I/O operations per second rate of write operation affecting the block device
+    optional uint64 io_max_rbps = 1; // Throttle the bytes per second rate of read operation affecting the block device
+    optional uint64 io_max_riops = 2;// Throttle the I/O operations per second rate of read operation affecting the block device
+    optional uint64 io_max_wbps = 3; // Throttle the bytes per second rate of write operation affecting the block device
+    optional uint64 io_max_wiops =4; // Throttle the I/O operations per second rate of write operation affecting the block device
 }
 
 message StartRequest {
