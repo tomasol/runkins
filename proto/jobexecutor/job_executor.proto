@@ -3,29 +3,70 @@ syntax = "proto3";
 package jobexecutor;
 
 service JobExecutor {
+    // Start new job, return ExecutionId handle for other RPCs
     rpc Start(StartRequest) returns (StartResponse);
+    // Kill the job
     rpc Stop(StopRequest) returns (StopResponse);
+    // See if the job is still running.
     rpc JobStatus(StatusRequest) returns (StatusResponse);
+    // Stream stdout and stderr.
+    // The stream will start from beginning and will be closed by the server
+    // once the job finishes.
     rpc GetOutput(OutputRequest) returns (stream OutputResponse);
+    // Remove output, status and all other data related to the job.
+    // Can be called only after the job is finished.
     rpc Remove(RemoveRequest) returns (RemoveResponse);
 }
 
 message ExecutionId {
-    uint32 id = 1;
+    uint64 id = 1;
+}
+
+message CGroup {
+    // cgroups v2. See https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html
+    MemoryLimit memory_limit = 1;
+    CpuLimit cpu_limit = 2;
+    BlockDeviceLimit block_device_limit = 3;
+}
+
+message MemoryLimit {
+    // Memory usage hard limit. See "memory.max".
+    uint64 memory_max = 1;
+}
+
+/*
+CPU limit. See "cpu.max".
+For example, if job can access a single CPU for 0.2 seconds out of every 1 second,
+set quota to 200000 and period to 1000000.
+*/
+message CpuLimit {
+    // The maximum bandwidth limit. See "cpu.max".
+    uint64 cpu_max_quota_micros = 1;
+    uint64 cpu_max_period_micros = 2; // window size
+}
+
+message BlockDeviceLimit {
+    // Block device limits. BPS and IOPS based IO limit. See "io.max".
+    uint64 io_max_rbps = 1; // Throttle the bytes per second rate of read operation affecting the block device
+    uint64 io_max_riops = 2;// Throttle the I/O operations per second rate of read operation affecting the block device
+    uint64 io_max_wbps = 3; // Throttle the bytes per second rate of write operation affecting the block device
+    uint64 io_max_wiops =4; // Throttle the I/O operations per second rate of write operation affecting the block device
 }
 
 message StartRequest {
-  string path = 1;
-  repeated string args = 2;
+    string path = 1;
+    repeated string args = 2;
+    optional CGroup cgroup = 3;
+    // TODO low: consider adding working directory and env. vars
 }
 
 message StartResponse {
     ExecutionId id = 1;
-    // TODO add cgroup limits
 }
 
 message StopRequest {
     ExecutionId id = 1;
+    // Clean up all resources like stdout, stderr, status etc.
     bool remove = 2;
 }
 
@@ -37,7 +78,17 @@ message StatusRequest {
 }
 
 message StatusResponse {
-    string state = 2; // "Running" or ExitStatus.to_string()
+    message StatusRunning {}
+    message ExitedWithSignal {}
+    message ExitedWithCode {
+        int32 code = 1;
+    }
+
+    oneof state {
+        StatusRunning running = 1;
+        ExitedWithSignal signal = 2;
+        ExitedWithCode code = 3;
+    }
 }
 
 message OutputRequest {
@@ -46,7 +97,6 @@ message OutputRequest {
 
 message OutputChunk {
     string chunk = 1;
-    // TODO timestamp
 }
 
 message OutputResponse {
@@ -59,5 +109,5 @@ message RemoveRequest {
 }
 
 message RemoveResponse {
-    
+
 }

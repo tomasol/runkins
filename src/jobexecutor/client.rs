@@ -7,6 +7,8 @@ pub mod job_executor {
     tonic::include_proto!("jobexecutor");
 }
 
+type PID = u64;
+
 #[derive(StructOpt, Debug)]
 #[structopt(about = "Job executor CLI")]
 enum Subcommand {
@@ -17,18 +19,18 @@ enum Subcommand {
         args: Vec<String>,
     },
     Status {
-        pid: u32,
+        pid: PID,
     },
     Stop {
         #[structopt(short, long)]
         remove: bool,
-        pid: u32,
+        pid: PID,
     },
     Output {
-        pid: u32,
+        pid: PID,
     },
     Remove {
-        pid: u32,
+        pid: PID,
     },
 }
 
@@ -43,7 +45,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match opt {
         Subcommand::Start { path, args } => {
-            let request = tonic::Request::new(StartRequest { path, args });
+            let request = tonic::Request::new(StartRequest {
+                path,
+                args,
+                cgroup: None,
+            });
             debug!("Request=${:?}", request);
             let response = client.start(request).await?;
             info!("Response={:?}", response);

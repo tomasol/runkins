@@ -23,25 +23,27 @@ pub mod job_executor {
     tonic::include_proto!("jobexecutor");
 }
 
+type ClientTx = UnboundedSender<Result<OutputResponse, tonic::Status>>; // consider adding Display trait for showing IP:port of client
+type PID = u64;
+
 #[derive(Debug, Default)]
 pub struct MyJobExecutor {
-    child_storage: Mutex<HashMap<u32, ChildInfo>>,
+    child_storage: Mutex<HashMap<PID, ChildInfo>>,
 }
 
 #[derive(Debug)]
 struct ChildInfo {
-    pid: u32,
+    pid: PID,
     child: Mutex<Child>,
     actor_tx: UnboundedSender<ActorEvent>,
 }
-
-type ClientTx = UnboundedSender<Result<OutputResponse, tonic::Status>>; // consider adding Display trait for showing IP:port of client
 
 #[derive(Debug)]
 enum ActorEvent {
     StdOutLine(String),
     ClientAdded(ClientTx),
     StdOutFinished,
+    // TODO ProcessFinished - simplify status? clean up cgroup?
 }
 
 impl ChildInfo {
@@ -54,7 +56,7 @@ impl ChildInfo {
             })
     }
 
-    async fn stdout_reader(pid: u32, stdout: ChildStdout, tx: UnboundedSender<ActorEvent>) {
+    async fn stdout_reader(pid: PID, stdout: ChildStdout, tx: UnboundedSender<ActorEvent>) {
         debug!("[{}] stdout_reader started", pid);
         let mut buf_stdout = BufReader::new(stdout);
         loop {
@@ -91,7 +93,7 @@ impl ChildInfo {
         }
     }
 
-    async fn actor(pid: u32, mut rx: UnboundedReceiver<ActorEvent>) {
+    async fn actor(pid: PID, mut rx: UnboundedReceiver<ActorEvent>) {
         debug!("[{}] actor started", pid);
         let mut lines: Vec<String> = vec![];
         let mut clients: Vec<ClientTx> = vec![];
@@ -169,7 +171,7 @@ impl ChildInfo {
         }
     }
 
-    pub fn new(mut child: Child, pid: u32) -> Result<Self, tonic::Status> {
+    pub fn new(mut child: Child, pid: PID) -> Result<Self, tonic::Status> {
         let stdout = child
             .stdout
             .take()
@@ -232,7 +234,7 @@ impl JobExecutor for MyJobExecutor {
 
         // obtain lock
         let mut store = self.child_storage.lock().await;
-        let pid: u32 = loop {
+        let pid: PID = loop {
             let random = thread_rng().gen();
             if !store.contains_key(&random) {
                 break random;
@@ -262,11 +264,16 @@ impl JobExecutor for MyJobExecutor {
         let child_info = child_storage
             .get(&pid)
             .ok_or_else(|| tonic::Status::not_found("Cannot find job"))?;
-        let state = child_info
-            .status()
-            .await?
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "Running".to_string());
+
+        let state = Some(match child_info.status().await? {
+            None => status_response::State::Running(status_response::StatusRunning {}),
+            Some(exit_status) => match exit_status.code() {
+                Some(code) => {
+                    status_response::State::Code(status_response::ExitedWithCode { code })
+                }
+                None => status_response::State::Signal(status_response::ExitedWithSignal {}),
+            },
+        });
         Ok(Response::new(job_executor::StatusResponse { state }))
     }
 
