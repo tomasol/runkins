@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::process::ExitStatus;
 use std::process::Stdio;
 use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncRead;
 use tokio::io::BufReader;
-use tokio::process::ChildStdout;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -24,26 +24,41 @@ pub mod job_executor {
 }
 
 type ClientTx = UnboundedSender<Result<OutputResponse, tonic::Status>>; // consider adding Display trait for showing IP:port of client
-type PID = u64;
+type Pid = u64;
 
 #[derive(Debug, Default)]
 pub struct MyJobExecutor {
-    child_storage: Mutex<HashMap<PID, ChildInfo>>,
+    child_storage: Mutex<HashMap<Pid, ChildInfo>>,
 }
 
 #[derive(Debug)]
 struct ChildInfo {
-    pid: PID,
+    pid: Pid,
     child: Mutex<Child>,
     actor_tx: UnboundedSender<ActorEvent>,
 }
 
 #[derive(Debug)]
 enum ActorEvent {
-    StdOutLine(String),
+    ChunkAdded(Chunk),
     ClientAdded(ClientTx),
-    StdOutFinished,
-    // TODO ProcessFinished - simplify status? clean up cgroup?
+    ProcessFinished, // TODO send this event
+}
+
+#[derive(Debug)]
+enum Chunk {
+    StdOut(String),
+    StdErr(String),
+}
+
+impl Chunk {
+    fn new(is_stdout: bool, string: String) -> Chunk {
+        if is_stdout {
+            Chunk::StdOut(string)
+        } else {
+            Chunk::StdErr(string)
+        }
+    }
 }
 
 impl ChildInfo {
@@ -56,64 +71,68 @@ impl ChildInfo {
             })
     }
 
-    async fn stdout_reader(pid: PID, stdout: ChildStdout, tx: UnboundedSender<ActorEvent>) {
-        debug!("[{}] stdout_reader started", pid);
-        let mut buf_stdout = BufReader::new(stdout);
+    async fn std_forwarder<T: AsyncRead + std::marker::Unpin>(
+        pid: Pid,
+        tx: UnboundedSender<ActorEvent>,
+        mut buf_reader: BufReader<T>,
+        is_stdout: bool,
+    ) {
+        debug!("[{}] std_forwarder({}) started", pid, is_stdout);
         loop {
             let mut line = String::new();
             // sending larger chunks than one line might increase performance
-            match buf_stdout.read_line(&mut line).await {
+            match buf_reader.read_line(&mut line).await {
                 Ok(0) => {
-                    debug!("[{}] stdout_reader is done reading", pid);
+                    debug!("[{}] std_forwarder({}) is done reading", pid, is_stdout);
                     break;
                 }
                 Ok(_) => {
                     // send the line to the actor
-                    debug!("[{}] stdout_reader got line - {}", pid, line);
-                    let send_result = tx.send(ActorEvent::StdOutLine(line));
+                    debug!("[{}] std_forwarder({}) got line - {}", pid, is_stdout, line);
+                    let message = ActorEvent::ChunkAdded(Chunk::new(is_stdout, line));
+                    let send_result = tx.send(message);
                     if let Err(err) = send_result {
-                        // rx closed or dropped, so actor died
-                        info!("[{}] stdout_reader - Cannot send the line: {}", pid, err);
+                        // rx closed or dropped, so the main actor died
+                        info!(
+                            "[{}] std_forwarder({}) - Cannot send the line: {}",
+                            pid, is_stdout, err
+                        );
                         break;
                     }
                 }
                 Err(err) => {
-                    error!("[{}] stdout_reader - Error in read_line: {}", pid, err);
+                    error!(
+                        "[{}] std_forwarder({}) - Error in read_line: {}",
+                        pid, is_stdout, err
+                    );
                     // IO error or invalid UTF, consider recovery. For now just finish reading.
                     break;
                 }
             }
         }
-        debug!("[{}] stdout_reader finished", pid);
-        if let Err(err) = tx.send(ActorEvent::StdOutFinished) {
-            error!(
-                "[{}] stdout_reader could not send StdOutFinished - {}",
-                pid, err
-            );
-        }
+        debug!("[{}] std_forwarder({}) finished", pid, is_stdout);
     }
 
-    async fn actor(pid: PID, mut rx: UnboundedReceiver<ActorEvent>) {
+    async fn actor(pid: Pid, mut rx: UnboundedReceiver<ActorEvent>) {
         debug!("[{}] actor started", pid);
-        let mut lines: Vec<String> = vec![];
+        let mut chunks: Vec<Chunk> = vec![];
         let mut clients: Vec<ClientTx> = vec![];
         let mut exited = false;
         while let Some(event) = rx.recv().await {
             debug!(
-                "[{}] actor event={:?}, lines={}, clients={}, exited={}",
+                "[{}] actor event={:?}, chunks={}, clients={}, exited={}",
                 pid,
                 event,
-                lines.len(),
+                chunks.len(),
                 clients.len(),
                 exited
             );
             match event {
-                ActorEvent::StdOutLine(line) => {
-                    assert!(!exited, "Illegal state - StdOutLine after StdOutFinished");
-                    lines.push(line.clone());
+                ActorEvent::ChunkAdded(chunk) => {
+                    assert!(!exited, "Illegal state - StdOutLine after ProcessFinished");
                     // notify all clients
                     clients.retain(|client_tx| {
-                        let res = ChildInfo::send_line(client_tx, &line);
+                        let res = ChildInfo::send_line(client_tx, &chunk);
                         if let Err(()) = res {
                             info!("[{}] Removing client {:?}", pid, client_tx);
                             false
@@ -121,10 +140,11 @@ impl ChildInfo {
                             true
                         }
                     });
+                    chunks.push(chunk);
                     // memory improvement: detect when client closes the connection and drop the handle
                 }
                 ActorEvent::ClientAdded(client_tx) => {
-                    let send_result = ChildInfo::send_everything(&client_tx, &lines);
+                    let send_result = ChildInfo::send_everything(&client_tx, &chunks);
                     if let Ok(()) = send_result {
                         if !exited {
                             // add to clients
@@ -138,7 +158,7 @@ impl ChildInfo {
                         // TODO test that in this state the RPC finished
                     }
                 }
-                ActorEvent::StdOutFinished => {
+                ActorEvent::ProcessFinished => {
                     exited = true;
                     // disconnect all clients
                     clients.clear();
@@ -150,47 +170,65 @@ impl ChildInfo {
     }
 
     // send everything to this client. This might be a bottleneck if many clients start connecting.
-    fn send_everything(client_tx: &ClientTx, lines: &[String]) -> Result<(), ()> {
-        for line in lines {
-            ChildInfo::send_line(client_tx, line)?;
+    fn send_everything(client_tx: &ClientTx, chunks: &[Chunk]) -> Result<(), ()> {
+        for chunk in chunks {
+            ChildInfo::send_line(client_tx, chunk)?;
         }
         Ok(())
     }
 
-    fn send_line(client_tx: &ClientTx, line: &str) -> Result<(), ()> {
-        client_tx
-            .send(Ok(ChildInfo::construct_output_response(line.to_string())))
-            .map_err(|_| ())?;
+    fn send_line(client_tx: &ClientTx, chunk: &Chunk) -> Result<(), ()> {
+        let output_response = match chunk {
+            Chunk::StdOut(str) => OutputResponse {
+                std_out_chunk: Some(OutputChunk {
+                    chunk: str.to_string(),
+                }),
+                std_err_chunk: None,
+            },
+            Chunk::StdErr(str) => OutputResponse {
+                std_out_chunk: None,
+                std_err_chunk: Some(OutputChunk {
+                    chunk: str.to_string(),
+                }),
+            },
+        };
+        client_tx.send(Ok(output_response)).map_err(|_| ())?; // TODO do not hide the error
         Ok(())
     }
 
-    fn construct_output_response(stdout: String) -> OutputResponse {
-        OutputResponse {
-            std_out_chunk: Some(OutputChunk { chunk: stdout }),
-            std_err_chunk: None,
-        }
-    }
-
-    pub fn new(mut child: Child, pid: PID) -> Result<Self, tonic::Status> {
+    pub fn new(mut child: Child, pid: Pid) -> Result<Self, tonic::Status> {
         let stdout = child
             .stdout
             .take()
             .ok_or_else(|| tonic::Status::internal("Cannot take stdout"))?;
+
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| tonic::Status::internal("Cannot take stderr"))?;
+
         let (tx, rx) = mpsc::unbounded_channel();
-        let actor_tx = tx.clone();
 
         tokio::spawn(async move {
             ChildInfo::actor(pid, rx).await;
         });
-
-        tokio::spawn(async move {
-            ChildInfo::stdout_reader(pid, stdout, tx).await;
-        });
+        {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                ChildInfo::std_forwarder(pid, tx, BufReader::new(stdout), true).await;
+            });
+        }
+        {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                ChildInfo::std_forwarder(pid, tx, BufReader::new(stderr), false).await;
+            });
+        }
 
         Ok(ChildInfo {
             child: Mutex::new(child),
             pid,
-            actor_tx,
+            actor_tx: tx,
         })
     }
 
@@ -234,7 +272,7 @@ impl JobExecutor for MyJobExecutor {
 
         // obtain lock
         let mut store = self.child_storage.lock().await;
-        let pid: PID = loop {
+        let pid: Pid = loop {
             let random = thread_rng().gen();
             if !store.contains_key(&random) {
                 break random;

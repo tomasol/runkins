@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use job_executor::job_executor_client::*;
 use job_executor::*;
 use log::*;
@@ -7,33 +9,33 @@ pub mod job_executor {
     tonic::include_proto!("jobexecutor");
 }
 
-type PID = u64;
+type Pid = u64;
 
 #[derive(StructOpt, Debug)]
 #[structopt(about = "Job executor CLI")]
 enum Subcommand {
     Start {
-        // #[structopt(short, long)]
         path: String,
         #[structopt()]
         args: Vec<String>,
     },
     Status {
-        pid: PID,
+        pid: Pid,
     },
     Stop {
-        pid: PID,
+        pid: Pid,
     },
     Output {
-        pid: PID,
+        pid: Pid,
     },
     Remove {
-        pid: PID,
+        pid: Pid,
     },
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // TODO nicer printing of error messages
     env_logger::init();
 
     let opt = Subcommand::from_args();
@@ -51,9 +53,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             debug!("Request=${:?}", request);
             let response = client.start(request).await?;
             info!("Response={:?}", response);
-            if let Some(id) = response.into_inner().id {
-                println!("{}", id.id);
-            }
+            let id = response.into_inner().id.unwrap();
+            println!("{}", id.id);
         }
         Subcommand::Status { pid } => {
             let request = tonic::Request::new(StatusRequest {
@@ -62,6 +63,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             debug!("Request=${:?}", request);
             let response = client.job_status(request).await?;
             info!("Response={:?}", response);
+            let status_response = response.into_inner();
+            let message = match status_response.status() {
+                status_response::RunningStatus::Running => "Running".to_string(),
+                status_response::RunningStatus::ExitedWithSignal => {
+                    "Exited with signal".to_string()
+                }
+                status_response::RunningStatus::ExitedWithCode => {
+                    format!("Exited with code {}", status_response.exit_code.unwrap())
+                }
+            };
+            println!("{}", message);
         }
         Subcommand::Stop { pid } => {
             let request = tonic::Request::new(StopRequest {
@@ -70,6 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             debug!("Request=${:?}", request);
             let response = client.stop(request).await?;
             info!("Response={:?}", response);
+            println!("ok");
         }
         Subcommand::Output { pid } => {
             let request = tonic::Request::new(OutputRequest {
@@ -77,9 +90,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
             debug!("Request=${:?}", request);
             let mut stream = client.get_output(request).await?.into_inner();
-
+            let stdout = std::io::stdout();
+            let mut stdout = stdout.lock();
+            let stderr = std::io::stderr();
+            let mut stderr = stderr.lock();
             while let Some(chunk) = stream.message().await? {
-                println!("chunk = {:?}", chunk);
+                if let Some(output_chunk) = chunk.std_out_chunk {
+                    stdout.write_all(output_chunk.chunk.as_bytes())?;
+                }
+                if let Some(output_chunk) = chunk.std_err_chunk {
+                    stderr.write_all(output_chunk.chunk.as_bytes())?;
+                }
             }
         }
         Subcommand::Remove { pid } => {
@@ -89,6 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             debug!("Request=${:?}", request);
             let response = client.remove(request).await?;
             info!("Response={:?}", response);
+            println!("ok");
         }
     };
     Ok(())

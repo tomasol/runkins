@@ -9,7 +9,11 @@ fn main() {
     }
 
     loop {
-        println!("{}", i);
+        if i % 2 == 0 {
+            println!("{}", i);
+        } else {
+            eprintln!("{}", i);
+        }
         i += 1;
         if max == Some(i) {
             break;
