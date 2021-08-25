@@ -265,16 +265,21 @@ impl JobExecutor for MyJobExecutor {
             .get(&pid)
             .ok_or_else(|| tonic::Status::not_found("Cannot find job"))?;
 
-        let state = Some(match child_info.status().await? {
-            None => status_response::State::Running(status_response::StatusRunning {}),
+        let mut exit_code = None;
+        let status = match child_info.status().await? {
+            None => status_response::RunningStatus::Running,
             Some(exit_status) => match exit_status.code() {
                 Some(code) => {
-                    status_response::State::Code(status_response::ExitedWithCode { code })
+                    exit_code = Some(code);
+                    status_response::RunningStatus::ExitedWithCode
                 }
-                None => status_response::State::Signal(status_response::ExitedWithSignal {}),
+                None => status_response::RunningStatus::ExitedWithSignal,
             },
-        });
-        Ok(Response::new(job_executor::StatusResponse { state }))
+        };
+        Ok(Response::new(job_executor::StatusResponse {
+            status: status as i32,
+            exit_code,
+        }))
     }
 
     async fn stop(

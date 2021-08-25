@@ -78,17 +78,15 @@ message StatusRequest {
 }
 
 message StatusResponse {
-    message StatusRunning {}
-    message ExitedWithSignal {}
-    message ExitedWithCode {
-        int32 code = 1;
+
+    enum RunningStatus {
+        RUNNING = 0;
+        EXITED_WITH_SIGNAL = 1;
+        EXITED_WITH_CODE = 2;
     }
 
-    oneof state {
-        StatusRunning running = 1;
-        ExitedWithSignal signal = 2;
-        ExitedWithCode code = 3;
-    }
+    RunningStatus status = 1;
+    optional int32 exit_code = 2;
 }
 
 message OutputRequest {
