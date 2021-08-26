@@ -1,6 +1,7 @@
 # jobexecutor
 
 Folder structure:
+* cgexec-rs - binary `cgexec-rs` - based on `cgexec` [doc](https://linux.die.net/man/1/cgexec) [src](https://github.com/libcgroup/libcgroup/blob/main/src/tools/cgexec.c), used by the server
 * cli - binary `jobexecutor-cli` - CLI
 * jobexecutor - library used by the server
 * proto - `*.proto` definition
@@ -8,10 +9,15 @@ Folder structure:
 * testing - binary `slow` for testing
 
 ## Building
-Requirements:
+### Requirements
 * Minimum Supported Rust Version: 1.54.0
-* cgroup v2 enabled, see the cgroup section.
 
+For cgroup functionality (required when running a process with limits set):
+* cgroup v2 enabled
+* `systemd --version` >= 244 for cgroup v2 controller delegation to non-root users. This can be worked around e.g. by running as root.
+
+More information can be found in **cgroup** section and in [cgexec-rs](cgexec-rs/README.md) .
+### cargo build
 To create a debug build of all components run
 ```sh
 cargo build
@@ -77,12 +83,24 @@ Not implemented yet.
 ## cgroup
 Currently not implemented.
 
-* [Enabling v2](https://rootlesscontaine.rs/getting-started/common/cgroup2/)
+To check that cgroup v2 is enabled and the required controllers (`memory`, `cpu`, `io`)
+can be delegated, follow this [guide](https://rootlesscontaine.rs/getting-started/common/cgroup2/)
+
+To manually create a cgroup:
+```sh
+mkdir /sys/fs/cgroup/cg1
+echo 0 > /sys/fs/cgroup/cg1/memory.swap.max
+echo 10000000 > /sys/fs/cgroup/cg1/memory.max
+echo $PID >> /sys/fs/cgroup/cg1/cgroup.procs
+```
+To use `cgexec-rs`:
+```sh
+./target/debug/cgexec-rs /sys/fs/cgroup/cg1 sleep infinity
+```
 
 TODO:
 * permissions
 * creation
-* wrapper based on (cgexec)[https://github.com/libcgroup/libcgroup/blob/main/src/tools/cgexec.c]
 * cleanup (kill all pids, then cgroup)
 
 ## mTLS
