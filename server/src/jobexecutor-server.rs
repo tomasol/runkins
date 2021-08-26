@@ -507,6 +507,7 @@ impl JobExecutor for MyJobExecutor {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
+    // TODO make this configurable
     let addr = "[::1]:50051".parse()?;
     let exec = MyJobExecutor::default();
 

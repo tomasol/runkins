@@ -39,8 +39,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     let opt = Subcommand::from_args();
-    debug!("{:#?}", opt);
 
+    // TODO make this configurable
     let mut client = JobExecutorClient::connect("http://[::1]:50051").await?;
 
     match opt {
@@ -91,9 +91,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             debug!("Request=${:?}", request);
             let mut stream = client.get_output(request).await?.into_inner();
             let stdout = std::io::stdout();
-            let mut stdout = stdout.lock();
+            let mut stdout = std::io::BufWriter::new(stdout.lock());
             let stderr = std::io::stderr();
-            let mut stderr = stderr.lock();
+            let mut stderr = std::io::BufWriter::new(stderr.lock());
             while let Some(chunk) = stream.message().await? {
                 if let Some(output_chunk) = chunk.std_out_chunk {
                     stdout.write_all(output_chunk.chunk.as_bytes())?;
@@ -113,5 +113,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("ok");
         }
     };
+    /*
+    TODO
+    if let Err(err) = run(opt) {
+        for cause in err.causes() {
+            eprintln!("{}", cause);
+        }
+        std::process::exit(1);
+    }
+     */
     Ok(())
 }
