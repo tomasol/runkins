@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn exec_cli(opt: Subcommand) -> Result<(), Box<dyn std::error::Error>> {
-    // TODO make this configurable
+    // TODO low: make this configurable
     let mut client = JobExecutorClient::connect("http://[::1]:50051").await?;
 
     match opt {

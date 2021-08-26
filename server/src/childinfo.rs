@@ -10,25 +10,15 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::Sender;
 
-use job_executor::*;
-
-pub mod job_executor {
-    tonic::include_proto!("jobexecutor");
-}
-
-type ClientTx = UnboundedSender<Result<OutputResponse, tonic::Status>>; // consider adding Display trait for showing IP:port of client
+// Type of the writable part of a mpsc channel for streaming output chunks to a client.
+// consider adding Display trait for showing IP:port of the client
+type ClientTx<RESP> = UnboundedSender<Result<RESP /* OutputResponse */, tonic::Status>>;
 pub type Pid = u64;
 
 #[derive(Debug)]
-pub struct ChildInfo {
-    pid: Pid,
-    actor_tx: UnboundedSender<ActorEvent>,
-}
-
-#[derive(Debug)]
-enum ActorEvent {
+enum ActorEvent<RESP> {
     ChunkAdded(Chunk),                            // sent by std_forwarder
-    ClientAdded(ClientTx),                        // send by API call
+    ClientAdded(ClientTx<RESP>),                  // send by API call
     ProcessFinished(std::io::Result<ExitStatus>), // internal to main_actor
     StatusRequest(Sender<RunningState>),          // send by API call
     KillRequest(Sender<std::io::Result<()>>),     // send by API call
@@ -36,9 +26,24 @@ enum ActorEvent {
 }
 
 #[derive(Debug)]
-enum Chunk {
+pub struct ChildInfo<RESP> {
+    pid: Pid,
+    actor_tx: UnboundedSender<ActorEvent<RESP>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum Chunk {
     StdOut(String),
     StdErr(String),
+}
+
+impl Chunk {
+    fn new(std_stream: &StdStream, string: String) -> Chunk {
+        match std_stream {
+            StdStream::StdOut => Chunk::StdOut(string),
+            StdStream::StdErr => Chunk::StdErr(string),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -54,17 +59,8 @@ enum StdStream {
     StdErr,
 }
 
-impl Chunk {
-    fn new(std_stream: &StdStream, string: String) -> Chunk {
-        match std_stream {
-            StdStream::StdOut => Chunk::StdOut(string),
-            StdStream::StdErr => Chunk::StdErr(string),
-        }
-    }
-}
-
-impl ChildInfo {
-    pub fn add_client(&self, client_tx: ClientTx) -> Result<(), tonic::Status> {
+impl<RESP: std::fmt::Debug + Send + 'static> ChildInfo<RESP> {
+    pub fn add_client(&self, client_tx: ClientTx<RESP>) -> Result<(), tonic::Status> {
         self.actor_tx
             .send(ActorEvent::ClientAdded(client_tx))
             .map_err(|err| {
@@ -73,9 +69,11 @@ impl ChildInfo {
             })
     }
 
+    // Async task that reads StdStream and sends it in chunks
+    // to the provided event sender of main_actor.
     async fn std_forwarder<T: AsyncRead + std::marker::Unpin>(
         pid: Pid,
-        tx: UnboundedSender<ActorEvent>,
+        tx: UnboundedSender<ActorEvent<RESP>>,
         mut buf_reader: BufReader<T>,
         std_stream: StdStream,
     ) {
@@ -123,10 +121,15 @@ impl ChildInfo {
         }
     }
 
-    async fn main_actor(pid: Pid, mut rx: UnboundedReceiver<ActorEvent>, mut child: Child) {
+    async fn main_actor<F: Fn(Chunk) -> RESP>(
+        pid: Pid,
+        mut rx: UnboundedReceiver<ActorEvent<RESP>>,
+        mut child: Child,
+        chunk_to_output: F,
+    ) {
         debug!("[{}] actor started", pid);
         let mut chunks: Vec<Chunk> = vec![];
-        let mut clients: Vec<ClientTx> = vec![];
+        let mut clients: Vec<ClientTx<RESP>> = vec![];
         let mut running_state = RunningState::Running; // used for StatusRequest reporting
         let mut stream_finished_event_count = 0; // chunks is complete only when both events are received
 
@@ -174,7 +177,7 @@ impl ChildInfo {
                         );
                         // notify all clients, removing disconnected
                         clients.retain(|client_tx| {
-                            ChildInfo::send_line(pid, client_tx, &chunk)
+                            ChildInfo::send_line(pid, client_tx, chunk.clone(), &chunk_to_output)
                                 .map_err(|_| {
                                     info!("[{}] main_actor removing client {:?}", pid, client_tx);
                                 })
@@ -184,7 +187,8 @@ impl ChildInfo {
                         // memory improvement: detect when client closes the connection and drop the handle
                     }
                     ActorEvent::ClientAdded(client_tx) => {
-                        let send_result = ChildInfo::send_everything(pid, &client_tx, &chunks);
+                        let send_result =
+                            ChildInfo::send_everything(pid, &client_tx, &chunks, &chunk_to_output);
                         if let Ok(()) = send_result {
                             if stream_finished_event_count < 2 {
                                 // add to clients
@@ -231,34 +235,31 @@ impl ChildInfo {
     }
 
     // send everything to this client. This might be a bottleneck if many clients start connecting.
-    fn send_everything(pid: Pid, client_tx: &ClientTx, chunks: &[Chunk]) -> Result<(), ()> {
+    fn send_everything<F: Fn(Chunk) -> RESP>(
+        pid: Pid,
+        client_tx: &ClientTx<RESP>,
+        chunks: &[Chunk],
+        chunk_to_output: &F,
+    ) -> Result<(), ()> {
         for chunk in chunks {
-            ChildInfo::send_line(pid, client_tx, chunk)?;
+            ChildInfo::send_line(pid, client_tx, chunk.clone(), chunk_to_output)?;
         }
         Ok(())
     }
 
-    fn send_line(pid: Pid, client_tx: &ClientTx, chunk: &Chunk) -> Result<(), ()> {
+    fn send_line<F: Fn(Chunk) -> RESP>(
+        pid: Pid,
+        client_tx: &ClientTx<RESP>,
+        chunk: Chunk,
+        chunk_to_output: &F,
+    ) -> Result<(), ()> {
         trace!(
             "[{}] send_line chunk:{:?} client:{:?}",
             pid,
             chunk,
             client_tx
         );
-        let output_response = match chunk {
-            Chunk::StdOut(str) => OutputResponse {
-                std_out_chunk: Some(OutputChunk {
-                    chunk: str.to_string(),
-                }),
-                std_err_chunk: None,
-            },
-            Chunk::StdErr(str) => OutputResponse {
-                std_out_chunk: None,
-                std_err_chunk: Some(OutputChunk {
-                    chunk: str.to_string(),
-                }),
-            },
-        };
+        let output_response = chunk_to_output(chunk);
         client_tx.send(Ok(output_response)).map_err(|err| {
             warn!(
                 "[{}] Cannot send chunk to client {:?} - {}",
@@ -268,7 +269,11 @@ impl ChildInfo {
         Ok(())
     }
 
-    pub fn new(mut child: Child, pid: Pid) -> Result<Self, tonic::Status> {
+    pub fn new<F: Fn(Chunk) -> RESP + Send + 'static>(
+        mut child: Child,
+        pid: Pid,
+        chunk_to_output: F,
+    ) -> Result<Self, tonic::Status> {
         let stdout = child
             .stdout
             .take()
@@ -282,7 +287,7 @@ impl ChildInfo {
         let (tx, rx) = mpsc::unbounded_channel();
         // TODO benchmark against one giant select!
         tokio::spawn(async move {
-            ChildInfo::main_actor(pid, rx, child).await;
+            ChildInfo::main_actor(pid, rx, child, chunk_to_output).await;
         });
         {
             let tx = tx.clone();

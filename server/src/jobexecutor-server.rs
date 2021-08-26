@@ -16,9 +16,28 @@ use job_executor::job_executor_server::*;
 use job_executor::*;
 use tonic::{transport::Server, Response};
 
+pub mod job_executor {
+    tonic::include_proto!("jobexecutor");
+}
+
 #[derive(Debug, Default)]
 pub struct MyJobExecutor {
-    child_storage: Mutex<HashMap<Pid, ChildInfo>>,
+    child_storage: Mutex<HashMap<Pid, ChildInfo<OutputResponse>>>,
+}
+
+impl MyJobExecutor {
+    fn chunk_to_output(chunk: Chunk) -> OutputResponse {
+        match chunk {
+            Chunk::StdOut(str) => OutputResponse {
+                std_out_chunk: Some(OutputChunk { chunk: str }),
+                std_err_chunk: None,
+            },
+            Chunk::StdErr(str) => OutputResponse {
+                std_out_chunk: None,
+                std_err_chunk: Some(OutputChunk { chunk: str }),
+            },
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -52,7 +71,7 @@ impl JobExecutor for MyJobExecutor {
                 break random;
             }
         };
-        store.insert(pid, ChildInfo::new(child, pid)?);
+        store.insert(pid, ChildInfo::new(child, pid, Self::chunk_to_output)?);
 
         debug!("Assigned pid {} to the child process", pid);
         Ok(Response::new(StartResponse {
@@ -183,7 +202,7 @@ impl JobExecutor for MyJobExecutor {
 }
 
 async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
-    // TODO make this configurable
+    // TODO low: make this configurable
     let addr = "[::1]:50051".parse()?;
     let exec = MyJobExecutor::default();
 
