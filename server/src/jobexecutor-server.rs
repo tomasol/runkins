@@ -22,7 +22,7 @@ pub mod job_executor {
 
 #[derive(Debug, Default)]
 pub struct MyJobExecutor {
-    child_storage: Mutex<HashMap<Pid, ChildInfo<OutputResponse>>>,
+    child_storage: Mutex<HashMap<Pid, ChildInfo<OutputResponse, tonic::Status>>>,
 }
 
 impl MyJobExecutor {

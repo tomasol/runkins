@@ -23,16 +23,17 @@ pub enum ChildInfoError {
     CannotCaptureStream(String),
 }
 
-// Type of the writable part of a mpsc channel for streaming output chunks to a client.
-// consider adding Display trait for showing IP:port of the client
-type ClientTx<RESP> =
-    UnboundedSender<Result<RESP /* grpc generated OutputResponse */, tonic::Status>>;
+/// Type of the writable part of a mpsc channel for streaming output chunks to a client.
+/// RESP is a type that represents the output, ERR is not used internally.
+// TODO low: add Display trait for showing IP:port of the client
+type ClientTx<RESP, ERR> =
+    UnboundedSender<Result<RESP /* type of output response */, ERR /* not used here */>>;
 pub type Pid = u64;
 
 #[derive(Debug)]
-enum ActorEvent<RESP> {
+enum ActorEvent<RESP, ERR> {
     ChunkAdded(Chunk),                            // sent by std_forwarder
-    ClientAdded(ClientTx<RESP>),                  // send by API call
+    ClientAdded(ClientTx<RESP, ERR>),             // send by API call
     ProcessFinished(std::io::Result<ExitStatus>), // internal to main_actor
     StatusRequest(Sender<RunningState>),          // send by API call
     KillRequest(Sender<std::io::Result<()>>),     // send by API call
@@ -40,9 +41,9 @@ enum ActorEvent<RESP> {
 }
 
 #[derive(Debug)]
-pub struct ChildInfo<RESP> {
+pub struct ChildInfo<RESP, ERR> {
     pid: Pid,
-    actor_tx: UnboundedSender<ActorEvent<RESP>>,
+    actor_tx: UnboundedSender<ActorEvent<RESP, ERR>>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,8 +74,17 @@ enum StdStream {
     StdErr,
 }
 
-impl<RESP: std::fmt::Debug + Send + 'static> ChildInfo<RESP> {
-    pub fn add_client(&self, client_tx: ClientTx<RESP>) -> Result<(), ChildInfoError> {
+/// ChildInfo represents the started process, its state, output and all associated data.
+/// It starts several async tasks to keep track of the output and running status.
+/// Note about generic types:
+/// RESP is a type that represents the output, ERR is not used internally.
+/// Both types are used for streaming the output via mpsc channel, see ClientTx type.
+impl<RESP, ERR> ChildInfo<RESP, ERR>
+where
+    RESP: std::fmt::Debug + Send + 'static,
+    ERR: std::fmt::Debug + Send + 'static,
+{
+    pub fn add_client(&self, client_tx: ClientTx<RESP, ERR>) -> Result<(), ChildInfoError> {
         self.actor_tx
             .send(ActorEvent::ClientAdded(client_tx))
             .map_err(|err| {
@@ -87,7 +97,7 @@ impl<RESP: std::fmt::Debug + Send + 'static> ChildInfo<RESP> {
     // to the provided event sender of main_actor.
     async fn std_forwarder<T: AsyncRead + std::marker::Unpin>(
         pid: Pid,
-        tx: UnboundedSender<ActorEvent<RESP>>,
+        tx: UnboundedSender<ActorEvent<RESP, ERR>>,
         mut buf_reader: BufReader<T>,
         std_stream: StdStream,
     ) {
@@ -137,13 +147,13 @@ impl<RESP: std::fmt::Debug + Send + 'static> ChildInfo<RESP> {
 
     async fn main_actor<F: Fn(Chunk) -> RESP>(
         pid: Pid,
-        mut rx: UnboundedReceiver<ActorEvent<RESP>>,
+        mut rx: UnboundedReceiver<ActorEvent<RESP, ERR>>,
         mut child: Child,
         chunk_to_output: F,
     ) {
         debug!("[{}] actor started", pid);
         let mut chunks: Vec<Chunk> = vec![];
-        let mut clients: Vec<ClientTx<RESP>> = vec![];
+        let mut clients: Vec<ClientTx<RESP, ERR>> = vec![];
         let mut running_state = RunningState::Running; // used for StatusRequest reporting
         let mut stream_finished_event_count = 0; // chunks is complete only when both events are received
 
@@ -251,7 +261,7 @@ impl<RESP: std::fmt::Debug + Send + 'static> ChildInfo<RESP> {
     // send everything to this client. This might be a bottleneck if many clients start connecting.
     fn send_everything<F: Fn(Chunk) -> RESP>(
         pid: Pid,
-        client_tx: &ClientTx<RESP>,
+        client_tx: &ClientTx<RESP, ERR>,
         chunks: &[Chunk],
         chunk_to_output: &F,
     ) -> Result<(), ()> {
@@ -263,7 +273,7 @@ impl<RESP: std::fmt::Debug + Send + 'static> ChildInfo<RESP> {
 
     fn send_line<F: Fn(Chunk) -> RESP>(
         pid: Pid,
-        client_tx: &ClientTx<RESP>,
+        client_tx: &ClientTx<RESP, ERR>,
         chunk: Chunk,
         chunk_to_output: &F,
     ) -> Result<(), ()> {
