@@ -91,9 +91,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             debug!("Request=${:?}", request);
             let mut stream = client.get_output(request).await?.into_inner();
             let stdout = std::io::stdout();
-            let mut stdout = std::io::BufWriter::new(stdout.lock());
+            // consider wrapping with std::io::BufWriter once write performance becomes an issue
+            let mut stdout = stdout.lock();
             let stderr = std::io::stderr();
-            let mut stderr = std::io::BufWriter::new(stderr.lock());
+            let mut stderr = stderr.lock();
             while let Some(chunk) = stream.message().await? {
                 if let Some(output_chunk) = chunk.std_out_chunk {
                     stdout.write_all(output_chunk.chunk.as_bytes())?;
