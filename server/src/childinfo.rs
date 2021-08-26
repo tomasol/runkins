@@ -1,5 +1,6 @@
 use log::*;
 use std::process::ExitStatus;
+use thiserror::Error;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncRead;
 use tokio::io::BufReader;
@@ -10,9 +11,22 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::Sender;
 
+#[derive(Error, Debug)]
+pub enum ChildInfoError {
+    #[error("main_actor is no longer running - {0}")]
+    MainActorFinished(String),
+    #[error("cannot get the child process status")]
+    UnknownProcessStatus,
+    #[error("cannot stop the child process - {0}")]
+    CannotStopProcess(#[from] std::io::Error),
+    #[error("cannot capture {0} of the child process")]
+    CannotCaptureStream(String),
+}
+
 // Type of the writable part of a mpsc channel for streaming output chunks to a client.
 // consider adding Display trait for showing IP:port of the client
-type ClientTx<RESP> = UnboundedSender<Result<RESP /* OutputResponse */, tonic::Status>>;
+type ClientTx<RESP> =
+    UnboundedSender<Result<RESP /* grpc generated OutputResponse */, tonic::Status>>;
 pub type Pid = u64;
 
 #[derive(Debug)]
@@ -60,12 +74,12 @@ enum StdStream {
 }
 
 impl<RESP: std::fmt::Debug + Send + 'static> ChildInfo<RESP> {
-    pub fn add_client(&self, client_tx: ClientTx<RESP>) -> Result<(), tonic::Status> {
+    pub fn add_client(&self, client_tx: ClientTx<RESP>) -> Result<(), ChildInfoError> {
         self.actor_tx
             .send(ActorEvent::ClientAdded(client_tx))
             .map_err(|err| {
                 error!("[{}] Cannot add_client: {}", self.pid, err);
-                tonic::Status::internal("Cannot subscribe")
+                ChildInfoError::MainActorFinished("Cannot add client".to_string())
             })
     }
 
@@ -189,7 +203,7 @@ impl<RESP: std::fmt::Debug + Send + 'static> ChildInfo<RESP> {
                     ActorEvent::ClientAdded(client_tx) => {
                         let send_result =
                             ChildInfo::send_everything(pid, &client_tx, &chunks, &chunk_to_output);
-                        if let Ok(()) = send_result {
+                        if send_result.is_ok() {
                             if stream_finished_event_count < 2 {
                                 // add to clients
                                 clients.push(client_tx);
@@ -273,16 +287,16 @@ impl<RESP: std::fmt::Debug + Send + 'static> ChildInfo<RESP> {
         mut child: Child,
         pid: Pid,
         chunk_to_output: F,
-    ) -> Result<Self, tonic::Status> {
+    ) -> Result<Self, ChildInfoError> {
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| tonic::Status::internal("Cannot take stdout"))?;
+            .ok_or_else(|| ChildInfoError::CannotCaptureStream("stdout".to_string()))?;
 
         let stderr = child
             .stderr
             .take()
-            .ok_or_else(|| tonic::Status::internal("Cannot take stderr"))?;
+            .ok_or_else(|| ChildInfoError::CannotCaptureStream("stderr".to_string()))?;
 
         let (tx, rx) = mpsc::unbounded_channel();
         // TODO benchmark against one giant select!
@@ -304,7 +318,7 @@ impl<RESP: std::fmt::Debug + Send + 'static> ChildInfo<RESP> {
         Ok(ChildInfo { pid, actor_tx: tx })
     }
 
-    pub async fn status(&self) -> Result<Option<ExitStatus>, tonic::Status> {
+    pub async fn status(&self) -> Result<Option<ExitStatus>, ChildInfoError> {
         let (status_tx, status_rx) = oneshot::channel();
         self.actor_tx
             .send(ActorEvent::StatusRequest(status_tx))
@@ -313,28 +327,29 @@ impl<RESP: std::fmt::Debug + Send + 'static> ChildInfo<RESP> {
                     "[{}] Cannot send StatusRequest to the main actor - {}",
                     self.pid, err
                 );
-                tonic::Status::internal("Error while getting the job status")
+                ChildInfoError::MainActorFinished("Error while getting the job status".to_string())
             })?;
         match status_rx.await {
             Ok(RunningState::Running) => Ok(None),
             Ok(RunningState::Finished(exit_status)) => Ok(Some(exit_status)),
-            _ => Err(tonic::Status::internal(
-                "Error while getting the job status",
-            )),
+            _ => Err(ChildInfoError::UnknownProcessStatus),
         }
     }
 
-    pub async fn kill(&self) -> Result<(), tonic::Status> {
+    pub async fn kill(&self) -> Result<(), ChildInfoError> {
         let (kill_tx, kill_rx) = oneshot::channel();
         self.actor_tx
             .send(ActorEvent::KillRequest(kill_tx))
             .map_err(|_| {
                 error!("[{}] Unable to send kill message", self.pid);
-                tonic::Status::internal("Unable to send kill message")
+                ChildInfoError::MainActorFinished("Unable to send kill message".to_string())
             })?;
         match kill_rx.await {
-            Ok(_) => Ok(()),
-            _ => Err(tonic::Status::internal("Error while stopping the job")),
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(ChildInfoError::CannotStopProcess(err)),
+            Err(_) => Err(ChildInfoError::MainActorFinished(
+                "Error while stopping the job".to_string(),
+            )),
         }
     }
 }

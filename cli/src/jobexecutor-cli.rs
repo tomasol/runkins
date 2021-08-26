@@ -40,6 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = exec_cli(opt).await;
     if let Err(err) = result {
         eprintln!("CLI failed: {}", err);
+        // TODO unpack gRPC error, show only status and message
         let mut source = err.source();
         while let Some(source_err) = source {
             eprintln!(" Caused by: {}", source_err);
