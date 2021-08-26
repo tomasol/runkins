@@ -254,6 +254,12 @@ impl ChildInfo {
     }
 
     fn send_line(pid: Pid, client_tx: &ClientTx, chunk: &Chunk) -> Result<(), ()> {
+        trace!(
+            "[{}] send_line chunk:{:?} client:{:?}",
+            pid,
+            chunk,
+            client_tx
+        );
         let output_response = match chunk {
             Chunk::StdOut(str) => OutputResponse {
                 std_out_chunk: Some(OutputChunk {
