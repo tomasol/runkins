@@ -44,7 +44,7 @@ enum ActorEvent {
     ChunkAdded(Chunk),                            // sent by std_forwarder
     ClientAdded(ClientTx),                        // send by API call
     ProcessFinished(std::io::Result<ExitStatus>), // internal to main_actor
-    QueryStatus(Sender<RunningState>),            // send by API call
+    StatusRequest(Sender<RunningState>),          // send by API call
     KillRequest(Sender<std::io::Result<()>>),     // send by API call
     StreamFinished(StdStream),                    // Sent by std_forwarder tasks
 }
@@ -141,24 +141,19 @@ impl ChildInfo {
         debug!("[{}] actor started", pid);
         let mut chunks: Vec<Chunk> = vec![];
         let mut clients: Vec<ClientTx> = vec![];
-        let mut running_state = RunningState::Running; // used for QueryStatus reporting
+        let mut running_state = RunningState::Running; // used for StatusRequest reporting
         let mut stream_finished_event_count = 0; // chunks is complete only when both events are received
 
         loop {
-            let event = if running_state == RunningState::Running {
-                tokio::select! {
-                    exit_status_result = child.wait() => {
-                        debug!("[{}] main_actor finished waiting for child process: {:?}", pid, exit_status_result);
-                        Some(ActorEvent::ProcessFinished(exit_status_result))
-                    },
-                    Some(event) = rx.recv() => {
-                        Some(event)
-                    },
-                    else => None
-                }
-            } else {
-                // cannot use the select macro anymore, because child.wait() would always be selected
-                rx.recv().await
+            let event = tokio::select! {
+                exit_status_result = child.wait(), if running_state == RunningState::Running => {
+                    debug!("[{}] main_actor finished waiting for child process: {:?}", pid, exit_status_result);
+                    Some(ActorEvent::ProcessFinished(exit_status_result))
+                },
+                Some(event) = rx.recv() => {
+                    Some(event)
+                },
+                else => None
             };
 
             if let Some(event) = event {
@@ -172,21 +167,33 @@ impl ChildInfo {
                     stream_finished_event_count
                 );
                 match event {
+                    ActorEvent::ProcessFinished(running_status) => {
+                        // created by child.wait arm of select! above
+                        running_state = match running_status {
+                            Ok(exit_status) => RunningState::Finished(exit_status),
+                            Err(err) => {
+                                warn!(
+                                    "[{}] main_actor failed waiting for child process - {}",
+                                    pid, err
+                                );
+                                RunningState::WaitFailed
+                            }
+                        };
+                    }
                     ActorEvent::ChunkAdded(chunk) => {
                         assert!(
                             stream_finished_event_count < 2,
                             "[{}] main_actor in illegal state - ChunkAdded after receiving both StreamFinished events",
                             pid
                         );
-                        // notify all clients
+                        // notify all clients, removing disconnected
                         clients.retain(|client_tx| {
-                            let res = ChildInfo::send_line(pid, client_tx, &chunk);
-                            if let Err(()) = res {
-                                info!("[{}] main_actor removing client {:?}", pid, client_tx);
-                                false
-                            } else {
-                                true
-                            }
+                            ChildInfo::send_line(pid, client_tx, &chunk)
+                                .map_err(|_| {
+                                    info!("[{}] main_actor removing client {:?}", pid, client_tx);
+                                    ()
+                                })
+                                .is_ok()
                         });
                         chunks.push(chunk);
                         // memory improvement: detect when client closes the connection and drop the handle
@@ -203,26 +210,13 @@ impl ChildInfo {
                                 "[{}] main_actor not adding the client {:?}, error while replaying the output",
                                 pid, client_tx
                             );
-                            // TODO test that in this state the RPC finished
+                            // TODO test that in this state the RPC disconnects the client
                         }
                     }
-                    ActorEvent::ProcessFinished(running_status) => {
-                        // sent by child.wait arm of select! above
-                        running_state = match running_status {
-                            Ok(exit_status) => RunningState::Finished(exit_status),
-                            Err(err) => {
-                                warn!(
-                                    "[{}] main_actor failed waiting for child process - {}",
-                                    pid, err
-                                );
-                                RunningState::WaitFailed
-                            }
-                        };
-                    }
-                    ActorEvent::QueryStatus(status_tx) => {
+                    ActorEvent::StatusRequest(status_tx) => {
                         let send_result = status_tx.send(running_state.clone());
                         if send_result.is_err() {
-                            debug!("[{}] main_actor cannot reply to QueryStatus", pid);
+                            debug!("[{}] main_actor cannot reply to StatusRequest", pid);
                         }
                     }
                     ActorEvent::KillRequest(kill_tx) => {
@@ -317,10 +311,10 @@ impl ChildInfo {
     pub async fn status(&self) -> Result<Option<ExitStatus>, tonic::Status> {
         let (status_tx, status_rx) = oneshot::channel();
         self.actor_tx
-            .send(ActorEvent::QueryStatus(status_tx))
+            .send(ActorEvent::StatusRequest(status_tx))
             .map_err(|err| {
                 error!(
-                    "[{}] Cannot send QueryStatus to the main actor - {}",
+                    "[{}] Cannot send StatusRequest to the main actor - {}",
                     self.pid, err
                 );
                 tonic::Status::internal("Error while getting the job status")
