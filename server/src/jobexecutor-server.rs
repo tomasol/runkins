@@ -1,19 +1,15 @@
-mod childinfo;
-
+use childinfo::*;
+use job_executor::job_executor_server::*;
+use job_executor::*;
+use jobexecutor::childinfo;
 use log::*;
 use rand::prelude::*;
 use std::collections::HashMap;
-
 use std::process::Stdio;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-
-use anyhow::Context;
-use childinfo::*;
-use job_executor::job_executor_server::*;
-use job_executor::*;
 use tonic::{transport::Server, Response};
 
 pub mod job_executor {
@@ -57,7 +53,6 @@ impl JobExecutor for MyJobExecutor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .context("Cannot run command")
             .map_err(|err| {
                 tonic::Status::internal(format!("Cannot run command - {}", err))
                 // consider adding tracing id
@@ -229,11 +224,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     } else {
         Ok(())
-    }
-}
-
-impl From<ChildInfoError> for tonic::Status {
-    fn from(err: ChildInfoError) -> Self {
-        tonic::Status::internal(err.to_string())
     }
 }

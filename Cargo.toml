@@ -1,6 +1,7 @@
 [workspace]
 
 members = [
+  "jobexecutor",
   "server",
   "cli",
   "testing",
