@@ -35,11 +35,24 @@ enum Subcommand {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // TODO nicer printing of error messages
     env_logger::init();
-
     let opt = Subcommand::from_args();
+    let result = exec_cli(opt).await;
+    if let Err(err) = result {
+        eprintln!("CLI failed: {}", err);
+        let mut source = err.source();
+        while let Some(source_err) = source {
+            eprintln!(" Caused by: {}", source_err);
+            source = source_err.source();
+        }
+        eprintln!("Details: {:?}", err);
+        std::process::exit(1);
+    } else {
+        Ok(())
+    }
+}
 
+async fn exec_cli(opt: Subcommand) -> Result<(), Box<dyn std::error::Error>> {
     // TODO make this configurable
     let mut client = JobExecutorClient::connect("http://[::1]:50051").await?;
 
@@ -92,6 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut stream = client.get_output(request).await?.into_inner();
             let stdout = std::io::stdout();
             // consider wrapping with std::io::BufWriter once write performance becomes an issue
+            // however buffer might add delays to streaming
             let mut stdout = stdout.lock();
             let stderr = std::io::stderr();
             let mut stderr = stderr.lock();
@@ -114,14 +128,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("ok");
         }
     };
-    /*
-    TODO
-    if let Err(err) = run(opt) {
-        for cause in err.causes() {
-            eprintln!("{}", cause);
-        }
-        std::process::exit(1);
-    }
-     */
     Ok(())
 }

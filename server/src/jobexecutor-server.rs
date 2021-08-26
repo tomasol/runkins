@@ -191,7 +191,6 @@ impl ChildInfo {
                             ChildInfo::send_line(pid, client_tx, &chunk)
                                 .map_err(|_| {
                                     info!("[{}] main_actor removing client {:?}", pid, client_tx);
-                                    ()
                                 })
                                 .is_ok()
                         });
@@ -510,9 +509,7 @@ impl JobExecutor for MyJobExecutor {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
+async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // TODO make this configurable
     let addr = "[::1]:50051".parse()?;
     let exec = MyJobExecutor::default();
@@ -523,4 +520,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let result = run_server().await;
+    if let Err(err) = result {
+        eprintln!("Server failed: {}", err);
+        let mut source = err.source();
+        while let Some(source_err) = source {
+            eprintln!(" Caused by: {}", source_err);
+            source = source_err.source();
+        }
+        eprintln!("Details: {:?}", err);
+        std::process::exit(1);
+    } else {
+        Ok(())
+    }
 }
