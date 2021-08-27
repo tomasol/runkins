@@ -161,16 +161,17 @@ where
             let event = tokio::select! {
                 exit_status_result = child.wait(), if running_state == RunningState::Running => {
                     debug!("[{}] main_actor finished waiting for child process: {:?}", pid, exit_status_result);
-                    Some(ActorEvent::ProcessFinished(exit_status_result))
+                    ActorEvent::ProcessFinished(exit_status_result)
                 },
                 Some(event) = rx.recv() => {
-                    Some(event)
+                    event
                 },
-                else => None
+                else => {
+                    debug!("[{}] main_actor is terminating", pid);
+                    break;
+                }
             };
-
-            if let Some(event) = event {
-                trace!(
+            trace!(
                     "[{}] main_actor event={:?}, chunks={}, clients={}, running_state={:?}, stream_finished_event_count={}",
                     pid,
                     event,
@@ -179,81 +180,77 @@ where
                     running_state,
                     stream_finished_event_count
                 );
-                match event {
-                    ActorEvent::ProcessFinished(running_status) => {
-                        // created by child.wait arm of select! above
-                        running_state = match running_status {
-                            Ok(exit_status) => RunningState::Finished(exit_status),
-                            Err(err) => {
-                                warn!(
-                                    "[{}] main_actor failed waiting for child process - {}",
-                                    pid, err
-                                );
-                                RunningState::WaitFailed
-                            }
-                        };
-                    }
-                    ActorEvent::ChunkAdded(chunk) => {
-                        assert!(
+            match event {
+                ActorEvent::ProcessFinished(running_status) => {
+                    // created by child.wait arm of select! above
+                    running_state = match running_status {
+                        Ok(exit_status) => RunningState::Finished(exit_status),
+                        Err(err) => {
+                            warn!(
+                                "[{}] main_actor failed waiting for child process - {}",
+                                pid, err
+                            );
+                            RunningState::WaitFailed
+                        }
+                    };
+                }
+                ActorEvent::ChunkAdded(chunk) => {
+                    assert!(
                             stream_finished_event_count < 2,
                             "[{}] main_actor in illegal state - ChunkAdded after receiving both StreamFinished events",
                             pid
                         );
-                        // notify all clients, removing disconnected
-                        clients.retain(|client_tx| {
-                            ChildInfo::send_line(pid, client_tx, chunk.clone(), &chunk_to_output)
-                                .map_err(|_| {
-                                    info!("[{}] main_actor removing client {:?}", pid, client_tx);
-                                })
-                                .is_ok()
-                        });
-                        chunks.push(chunk);
-                        // memory improvement: detect when client closes the connection and drop the handle
-                    }
-                    ActorEvent::ClientAdded(client_tx) => {
-                        let send_result =
-                            ChildInfo::send_everything(pid, &client_tx, &chunks, &chunk_to_output);
-                        if send_result.is_ok() {
-                            if stream_finished_event_count < 2 {
-                                // add to clients
-                                clients.push(client_tx);
-                            } // otherwise drop client_tx which will disconnect the client
-                        } else {
-                            info!(
+                    // notify all clients, removing disconnected
+                    clients.retain(|client_tx| {
+                        ChildInfo::send_line(pid, client_tx, chunk.clone(), &chunk_to_output)
+                            .map_err(|_| {
+                                info!("[{}] main_actor removing client {:?}", pid, client_tx);
+                            })
+                            .is_ok()
+                    });
+                    chunks.push(chunk);
+                    // memory improvement: detect when client closes the connection and drop the handle
+                }
+                ActorEvent::ClientAdded(client_tx) => {
+                    let send_result =
+                        ChildInfo::send_everything(pid, &client_tx, &chunks, &chunk_to_output);
+                    if send_result.is_ok() {
+                        if stream_finished_event_count < 2 {
+                            // add to clients
+                            clients.push(client_tx);
+                        } // otherwise drop client_tx which will disconnect the client
+                    } else {
+                        info!(
                                 "[{}] main_actor not adding the client {:?}, error while replaying the output",
                                 pid, client_tx
                             );
-                            // TODO test that in this state the RPC disconnects the client
-                        }
-                    }
-                    ActorEvent::StatusRequest(status_tx) => {
-                        let send_result = status_tx.send(running_state.clone());
-                        if send_result.is_err() {
-                            debug!("[{}] main_actor cannot reply to StatusRequest", pid);
-                        }
-                    }
-                    ActorEvent::KillRequest(kill_tx) => {
-                        let send_result = kill_tx.send(child.kill().await);
-                        if send_result.is_err() {
-                            debug!("[{}] main_actor cannot reply to KillRequest", pid);
-                        }
-                    }
-                    ActorEvent::StreamFinished(_) => {
-                        stream_finished_event_count += 1;
-                        assert!(
-                            stream_finished_event_count <= 2,
-                            "[{}] Illegal StreamFinished count",
-                            pid
-                        );
-                        if stream_finished_event_count == 2 {
-                            // disconnect all clients, there will be no new chunks
-                            clients.clear();
-                        }
+                        // TODO test that in this state the RPC disconnects the client
                     }
                 }
-            } else {
-                debug!("[{}] main_actor is terminating", pid);
-                break;
+                ActorEvent::StatusRequest(status_tx) => {
+                    let send_result = status_tx.send(running_state.clone());
+                    if send_result.is_err() {
+                        debug!("[{}] main_actor cannot reply to StatusRequest", pid);
+                    }
+                }
+                ActorEvent::KillRequest(kill_tx) => {
+                    let send_result = kill_tx.send(child.kill().await);
+                    if send_result.is_err() {
+                        debug!("[{}] main_actor cannot reply to KillRequest", pid);
+                    }
+                }
+                ActorEvent::StreamFinished(_) => {
+                    stream_finished_event_count += 1;
+                    assert!(
+                        stream_finished_event_count <= 2,
+                        "[{}] Illegal StreamFinished count",
+                        pid
+                    );
+                    if stream_finished_event_count == 2 {
+                        // disconnect all clients, there will be no new chunks
+                        clients.clear();
+                    }
+                }
             }
         }
     }
