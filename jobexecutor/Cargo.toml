@@ -4,6 +4,7 @@ name = "jobexecutor"
 version = "0.1.0"
 
 [dependencies]
+anyhow = "1.0.42"
 log = "0.4"
 rand = "0.8"
 thiserror = "1.0"

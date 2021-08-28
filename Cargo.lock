@@ -390,6 +390,7 @@ checksum = "b71991ff56294aa922b450139ee08b3bfc70982c6b2c7562771375cf73542dd4"
 name = "jobexecutor"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "log",
  "rand",
  "thiserror",
@@ -416,6 +417,7 @@ dependencies = [
 name = "jobexecutor-server"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "env_logger",
  "jobexecutor",
  "log",

@@ -1,12 +1,11 @@
 use childinfo::*;
 use job_executor::job_executor_server::*;
 use job_executor::*;
+use jobexecutor::cgroup::{self, CGroupCommandWrapper, CGroupConfig};
 use jobexecutor::childinfo;
 use log::*;
 use rand::prelude::*;
 use std::collections::HashMap;
-use std::process::Stdio;
-use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -16,12 +15,20 @@ pub mod job_executor {
     tonic::include_proto!("jobexecutor");
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MyJobExecutor {
     child_storage: Mutex<HashMap<Pid, ChildInfo<OutputResponse, tonic::Status>>>,
+    cgroup_command_wrapper: CGroupCommandWrapper,
 }
 
 impl MyJobExecutor {
+    fn new(cgroup_command_wrapper: CGroupCommandWrapper) -> MyJobExecutor {
+        MyJobExecutor {
+            cgroup_command_wrapper,
+            child_storage: Default::default(),
+        }
+    }
+
     fn chunk_to_output(chunk: Chunk) -> OutputResponse {
         match chunk {
             Chunk::StdOut(str) => OutputResponse {
@@ -45,19 +52,6 @@ impl JobExecutor for MyJobExecutor {
         debug!("Request: {:?}", request);
         let start_req = request.into_inner();
 
-        let child = Command::new(start_req.path)
-            .args(start_req.args)
-            .current_dir(".") // consider making this configurable
-            // consider adding ability to control env.vars
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|err| {
-                tonic::Status::internal(format!("Cannot run command - {}", err))
-                // consider adding tracing id
-            })?;
-
         // obtain lock
         let mut store = self.child_storage.lock().await;
         let pid: Pid = loop {
@@ -66,9 +60,18 @@ impl JobExecutor for MyJobExecutor {
                 break random;
             }
         };
-        store.insert(pid, ChildInfo::new(child, pid, Self::chunk_to_output)?);
-
         debug!("Assigned pid {} to the child process", pid);
+        store.insert(
+            pid,
+            ChildInfo::new(
+                pid,
+                start_req.path,
+                start_req.args,
+                Self::chunk_to_output,
+                &self.cgroup_command_wrapper,
+            )?,
+        );
+
         Ok(Response::new(StartResponse {
             id: Some(ExecutionId { id: pid }),
         }))
@@ -196,10 +199,42 @@ impl JobExecutor for MyJobExecutor {
     }
 }
 
-async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
+fn guess_cgroup_config() -> Option<Result<cgroup::CGroupConfig, cgroup::CGroupValidationError>> {
+    let cgexec_rs = if let Ok(path) = std::env::var("CGEXEC_RS") {
+        path.into()
+    } else {
+        trace!("Guessing cgexec-rs location based on current_exe");
+        let exe = std::env::current_exe().ok()?;
+        exe.parent()?.join("cgexec-rs")
+    };
+    trace!("Using cgexec-rs {:?}", cgexec_rs);
+    let parent_cgroup = std::env::var("PARENT_CGROUP").ok()?.into();
+    trace!("Using parent_group {:?}", parent_cgroup);
+    Some(CGroupConfig::new(cgroup::CGroupConfigBuilder {
+        cgexec_rs,
+        parent_cgroup,
+    }))
+}
+
+async fn run_server() -> anyhow::Result<()> {
     // TODO low: make this configurable
     let addr = "[::1]:50051".parse()?;
-    let exec = MyJobExecutor::default();
+    let cgroup_config = match guess_cgroup_config() {
+        Some(Ok(config)) => {
+            info!("cgroup support enabled");
+            trace!("cgroup config {:?}", config);
+            Some(config)
+        }
+        None => {
+            info!("cgroup config is not complete, cgroup functionality will be disabled");
+            None
+        }
+        Some(Err(err)) => {
+            return Err(err.into());
+        }
+    };
+
+    let exec = MyJobExecutor::new(CGroupCommandWrapper::new(cgroup_config));
     info!("Starting gRPC server at {}", addr);
     Server::builder()
         .add_service(JobExecutorServer::new(exec))
@@ -210,19 +245,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> anyhow::Result<()> {
     env_logger::init();
-    let result = run_server().await;
-    if let Err(err) = result {
-        eprintln!("Server failed: {}", err);
-        let mut source = err.source();
-        while let Some(source_err) = source {
-            eprintln!(" Caused by: {}", source_err);
-            source = source_err.source();
-        }
-        eprintln!("Details: {:?}", err);
-        std::process::exit(1);
-    } else {
-        Ok(())
-    }
+    run_server().await
 }

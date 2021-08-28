@@ -1,5 +1,7 @@
+use anyhow::Context;
 use log::*;
 use std::process::ExitStatus;
+use std::process::Stdio;
 use thiserror::Error;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncRead;
@@ -11,6 +13,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::Sender;
 
+use crate::cgroup::CGroupCommandWrapper;
+
 #[derive(Error, Debug)]
 pub enum ChildInfoError {
     #[error("main_actor is no longer running - {0}")]
@@ -19,8 +23,10 @@ pub enum ChildInfoError {
     UnknownProcessStatus,
     #[error("cannot stop the child process - {0}")]
     CannotStopProcess(#[from] std::io::Error),
-    #[error("cannot capture {0} of the child process")]
-    CannotCaptureStream(String),
+    #[error("cannot capture {0:?} of the child process")]
+    CannotCaptureStream(StdStream),
+    #[error("cannot run command - {0}")]
+    CannotRunCommand(#[from] anyhow::Error),
 }
 
 /// Type of the writable part of a mpsc channel for streaming output chunks to a client.
@@ -69,7 +75,7 @@ enum RunningState {
 }
 
 #[derive(Debug)]
-enum StdStream {
+pub enum StdStream {
     StdOut,
     StdErr,
 }
@@ -291,19 +297,37 @@ where
     }
 
     pub fn new<F: Fn(Chunk) -> RESP + Send + 'static>(
-        mut child: Child,
         pid: Pid,
+        process_path: String,
+        process_args: Vec<String>,
         chunk_to_output: F,
+        cgroup_command_wrapper: &CGroupCommandWrapper,
     ) -> Result<Self, ChildInfoError> {
+        // construct command based on path and args
+        let mut command =
+            cgroup_command_wrapper.command(pid, &process_path, process_args.into_iter());
+        command
+            .current_dir(".") // consider making this configurable
+            // consider adding ability to control env.vars
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        // if cgroup is enabled, cgexec-rs will be executed instead
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("[{}] Cannot run command - {}", pid, process_path))
+            .map_err(ChildInfoError::CannotRunCommand)?;
+
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| ChildInfoError::CannotCaptureStream("stdout".to_string()))?;
+            .ok_or(ChildInfoError::CannotCaptureStream(StdStream::StdOut))?;
 
         let stderr = child
             .stderr
             .take()
-            .ok_or_else(|| ChildInfoError::CannotCaptureStream("stderr".to_string()))?;
+            .ok_or(ChildInfoError::CannotCaptureStream(StdStream::StdErr))?;
 
         let (tx, rx) = mpsc::unbounded_channel();
         // TODO benchmark against one giant select!
