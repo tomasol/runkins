@@ -1,7 +1,6 @@
 use anyhow::Context;
 use log::*;
 use std::process::ExitStatus;
-use std::process::Stdio;
 use thiserror::Error;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncRead;
@@ -13,7 +12,9 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::Sender;
 
-use crate::cgroup::CGroupCommandWrapper;
+use crate::cgroup::runtime::CGroupCommandError;
+use crate::cgroup::runtime::CGroupCommandFactory;
+use crate::cgroup::runtime::CGroupLimits;
 
 #[derive(Error, Debug)]
 pub enum ChildInfoError {
@@ -25,8 +26,10 @@ pub enum ChildInfoError {
     CannotStopProcess(#[from] std::io::Error),
     #[error("cannot capture {0:?} of the child process")]
     CannotCaptureStream(StdStream),
-    #[error("cannot run command - {0}")]
-    CannotRunCommand(#[from] anyhow::Error),
+    #[error("cannot run process - {0}")]
+    CannotRunProcess(#[from] anyhow::Error),
+    #[error("cannot run process in cgroup - {0}")]
+    ProcessExecutionError(#[from] CGroupCommandError),
 }
 
 /// Type of the writable part of a mpsc channel for streaming output chunks to a client.
@@ -301,23 +304,21 @@ where
         process_path: String,
         process_args: Vec<String>,
         chunk_to_output: F,
-        cgroup_command_wrapper: &CGroupCommandWrapper,
+        cgroup_command_factory: &CGroupCommandFactory,
+        limits: Option<CGroupLimits>,
     ) -> Result<Self, ChildInfoError> {
         // construct command based on path and args
-        let mut command =
-            cgroup_command_wrapper.command(pid, &process_path, process_args.into_iter());
-        command
-            .current_dir(".") // consider making this configurable
-            // consider adding ability to control env.vars
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        let mut command = cgroup_command_factory.create_command(
+            pid,
+            &process_path,
+            process_args.into_iter(),
+            limits,
+        )?;
 
-        // if cgroup is enabled, cgexec-rs will be executed instead
         let mut child = command
             .spawn()
-            .with_context(|| format!("[{}] Cannot run command - {}", pid, process_path))
-            .map_err(ChildInfoError::CannotRunCommand)?;
+            .with_context(|| format!("[{}] Cannot run process - {}", pid, process_path))
+            .map_err(ChildInfoError::CannotRunProcess)?;
 
         let stdout = child
             .stdout

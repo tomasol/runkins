@@ -15,6 +15,12 @@ type Pid = u64;
 #[structopt(about = "Job executor CLI")]
 enum Subcommand {
     Start {
+        // TODO low: allow setting limits in human writable form e.g. 10MB, 5ms, etc.
+        #[structopt(long)]
+        memory_max: Option<u64>,
+        #[structopt(long)]
+        memory_swap_max: Option<u64>,
+
         path: String,
         #[structopt()]
         args: Vec<String>,
@@ -58,12 +64,29 @@ async fn exec_cli(opt: Subcommand) -> Result<(), Box<dyn std::error::Error>> {
     let mut client = JobExecutorClient::connect("http://[::1]:50051").await?;
 
     match opt {
-        Subcommand::Start { path, args } => {
-            let request = tonic::Request::new(StartRequest {
-                path,
-                args,
-                cgroup: None,
-            });
+        Subcommand::Start {
+            path,
+            args,
+            memory_max,
+            memory_swap_max,
+        } => {
+            let cgroup = if memory_max.is_some() || memory_swap_max.is_some() {
+                let cgroup = CGroup {
+                    memory_limit: Some(MemoryLimit {
+                        memory_max,
+                        memory_swap_max,
+                    }),
+                    ..Default::default()
+                };
+
+                // TODO cpu, io
+
+                Some(cgroup)
+            } else {
+                None
+            };
+
+            let request = tonic::Request::new(StartRequest { path, args, cgroup });
             debug!("Request=${:?}", request);
             let response = client.start(request).await?;
             info!("Response={:?}", response);

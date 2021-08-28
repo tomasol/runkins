@@ -1,7 +1,11 @@
 use childinfo::*;
 use job_executor::job_executor_server::*;
 use job_executor::*;
-use jobexecutor::cgroup::{self, CGroupCommandWrapper, CGroupConfig};
+use jobexecutor::cgroup::runtime::CGroupCommandFactory;
+use jobexecutor::cgroup::runtime::CGroupLimits;
+use jobexecutor::cgroup::server_config::CGroupConfig;
+use jobexecutor::cgroup::server_config::CGroupConfigBuilder;
+use jobexecutor::cgroup::server_config::CGroupConfigError;
 use jobexecutor::childinfo;
 use log::*;
 use rand::prelude::*;
@@ -18,13 +22,13 @@ pub mod job_executor {
 #[derive(Debug)]
 pub struct MyJobExecutor {
     child_storage: Mutex<HashMap<Pid, ChildInfo<OutputResponse, tonic::Status>>>,
-    cgroup_command_wrapper: CGroupCommandWrapper,
+    cgroup_command_factory: CGroupCommandFactory,
 }
 
 impl MyJobExecutor {
-    fn new(cgroup_command_wrapper: CGroupCommandWrapper) -> MyJobExecutor {
+    fn new(cgroup_command_factory: CGroupCommandFactory) -> MyJobExecutor {
         MyJobExecutor {
-            cgroup_command_wrapper,
+            cgroup_command_factory,
             child_storage: Default::default(),
         }
     }
@@ -40,6 +44,17 @@ impl MyJobExecutor {
                 std_err_chunk: Some(OutputChunk { chunk: str }),
             },
         }
+    }
+
+    fn construct_limits(request_cgroup: CGroup) -> CGroupLimits {
+        let mut limits = CGroupLimits {
+            ..Default::default()
+        };
+        if let Some(memory) = request_cgroup.memory_limit {
+            limits.memory_max = memory.memory_max;
+            limits.memory_swap_max = memory.memory_swap_max;
+        }
+        limits
     }
 }
 
@@ -68,7 +83,8 @@ impl JobExecutor for MyJobExecutor {
                 start_req.path,
                 start_req.args,
                 Self::chunk_to_output,
-                &self.cgroup_command_wrapper,
+                &self.cgroup_command_factory,
+                start_req.cgroup.map(Self::construct_limits),
             )?,
         );
 
@@ -199,7 +215,7 @@ impl JobExecutor for MyJobExecutor {
     }
 }
 
-fn guess_cgroup_config() -> Option<Result<cgroup::CGroupConfig, cgroup::CGroupValidationError>> {
+fn guess_cgroup_config() -> Option<Result<CGroupConfig, CGroupConfigError>> {
     let cgexec_rs = if let Ok(path) = std::env::var("CGEXEC_RS") {
         path.into()
     } else {
@@ -210,7 +226,7 @@ fn guess_cgroup_config() -> Option<Result<cgroup::CGroupConfig, cgroup::CGroupVa
     trace!("Using cgexec-rs {:?}", cgexec_rs);
     let parent_cgroup = std::env::var("PARENT_CGROUP").ok()?.into();
     trace!("Using parent_group {:?}", parent_cgroup);
-    Some(CGroupConfig::new(cgroup::CGroupConfigBuilder {
+    Some(CGroupConfig::new(CGroupConfigBuilder {
         cgexec_rs,
         parent_cgroup,
     }))
@@ -234,7 +250,7 @@ async fn run_server() -> anyhow::Result<()> {
         }
     };
 
-    let exec = MyJobExecutor::new(CGroupCommandWrapper::new(cgroup_config));
+    let exec = MyJobExecutor::new(CGroupCommandFactory::new(cgroup_config));
     info!("Starting gRPC server at {}", addr);
     Server::builder()
         .add_service(JobExecutorServer::new(exec))
