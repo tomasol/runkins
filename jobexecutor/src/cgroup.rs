@@ -53,6 +53,7 @@ pub mod server_config {
 
         pub fn create_child_cgroup(&self, pid: Pid) -> io::Result<ChildCGroup> {
             let path = self.parent_cgroup.join(pid.to_string());
+            trace!("[{}] Creating child cgroup {:?}", pid, path);
             fs::create_dir(path.clone())?;
             Ok(ChildCGroup { path })
         }
@@ -77,19 +78,15 @@ pub mod server_config {
 }
 
 pub mod runtime {
-    use std::{fs::OpenOptions, io::Write, process::Stdio};
-
-    use anyhow::Context;
-
     use super::{
         server_config::{CGroupConfig, ChildCGroup},
         *,
     };
+    use anyhow::Context;
+    use std::{fs::OpenOptions, io::Write};
 
     #[derive(Error, Debug)]
     pub enum CGroupCommandError {
-        #[error("cannot run process with limits as cgroup is not configured")]
-        MissingCGroupConfiguration,
         #[error("cannot create child cgroup - {0}")]
         CGroupCreationFailed(#[from] std::io::Error),
         #[error("cannot configure child cgroup - {0}")]
@@ -97,70 +94,44 @@ pub mod runtime {
     }
 
     #[derive(Debug)]
-    pub struct CGroupCommandFactory {
-        cgroup_config: Option<CGroupConfig>,
-    }
+    pub struct CGroupCommandFactory {}
 
     impl CGroupCommandFactory {
-        pub fn new(cgroup_config: Option<CGroupConfig>) -> CGroupCommandFactory {
-            CGroupCommandFactory { cgroup_config }
-        }
-
         /// Create new [`Command`] using program name and arguments.
         /// If cgroup_config is set to support cgroup, new cgroup will
         /// be created no matter if limits are provided or not.
         pub fn create_command<I, S>(
-            &self,
+            cgroup_config: &CGroupConfig,
             pid: Pid,
             program: &S,
             args: I,
-            limits: Option<CGroupLimits>,
+            limits: CGroupLimits,
         ) -> Result<Command, CGroupCommandError>
         where
             I: ExactSizeIterator<Item = S>,
             S: AsRef<OsStr>,
         {
-            let mut command = if self.cgroup_config.is_some() {
-                let cgroup_config = self.cgroup_config.clone().unwrap();
-                trace!("[{}] Creating child cgroup", pid);
-                let child_cgroup_path = cgroup_config.create_child_cgroup(pid)?;
-                if let Some(limits) = limits {
-                    debug!(
-                        "[{}] Configuring {:?} in cgroup {:?}",
-                        pid, limits, child_cgroup_path
-                    );
-                    limits.write(&child_cgroup_path)?;
-                } else {
-                    debug!(
-                        "[{}] Keeping default limits in cgroup {:?}",
-                        pid, child_cgroup_path
-                    );
-                }
-
-                let mut command = Command::new(cgroup_config.cgexec_rs());
-                // first argument is the cgroup name
-                let mut new_args = Vec::with_capacity(args.len() + 2);
-                new_args.push(child_cgroup_path.as_os_string().to_owned());
-                // second is the program name
-                new_args.push(program.as_ref().to_owned());
-                new_args.extend(args.map(|item| item.as_ref().to_owned()));
-                trace!("[{}] Running cgexec-rs with args {:?}", pid, new_args);
-                command.args(new_args);
-                command
-            } else if limits.is_none() {
-                // run without limits - just create and pass the command
-                let mut command = Command::new(program);
-                command.args(args);
-                command
-            } else {
-                return Err(CGroupCommandError::MissingCGroupConfiguration);
-            };
-            // consider adding ability to control env.vars
-            command
-                .current_dir(".") // consider making this configurable
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
+            let child_cgroup_path = cgroup_config
+                .create_child_cgroup(pid)
+                .map_err(CGroupCommandError::CGroupCreationFailed)?;
+            trace!(
+                "[{}] Configuring {:?} in cgroup {:?}",
+                pid,
+                limits,
+                child_cgroup_path
+            );
+            limits
+                .write(&child_cgroup_path)
+                .map_err(CGroupCommandError::WritingCGroupConfigurationFailed)?;
+            let mut command = Command::new(cgroup_config.cgexec_rs());
+            // first argument is the cgroup name
+            let mut new_args = Vec::with_capacity(args.len() + 2);
+            new_args.push(child_cgroup_path.as_os_string().to_owned());
+            // second is the program name
+            new_args.push(program.as_ref().to_owned());
+            new_args.extend(args.map(|item| item.as_ref().to_owned()));
+            trace!("[{}] Running cgexec-rs with args {:?}", pid, new_args);
+            command.args(new_args);
             Ok(command)
         }
     }

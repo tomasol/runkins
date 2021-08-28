@@ -1,11 +1,13 @@
 use anyhow::Context;
 use log::*;
 use std::process::ExitStatus;
+use std::process::Stdio;
 use thiserror::Error;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncRead;
 use tokio::io::BufReader;
 use tokio::process::Child;
+use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
@@ -15,6 +17,7 @@ use tokio::sync::oneshot::Sender;
 use crate::cgroup::runtime::CGroupCommandError;
 use crate::cgroup::runtime::CGroupCommandFactory;
 use crate::cgroup::runtime::CGroupLimits;
+use crate::cgroup::server_config::CGroupConfig;
 
 #[derive(Error, Debug)]
 pub enum ChildInfoError {
@@ -304,17 +307,44 @@ where
         process_path: String,
         process_args: Vec<String>,
         chunk_to_output: F,
-        cgroup_command_factory: &CGroupCommandFactory,
-        limits: Option<CGroupLimits>,
+    ) -> Result<Self, ChildInfoError> {
+        let mut command = Command::new(&process_path);
+        command.args(process_args);
+        Self::new_internal(pid, command, chunk_to_output, &process_path)
+    }
+
+    pub fn new_with_cgroup<F: Fn(Chunk) -> RESP + Send + 'static>(
+        pid: Pid,
+        process_path: String,
+        process_args: Vec<String>,
+        chunk_to_output: F,
+        cgroup_config: &CGroupConfig,
+        limits: CGroupLimits,
     ) -> Result<Self, ChildInfoError> {
         // construct command based on path and args
-        let mut command = cgroup_command_factory.create_command(
+        let command = CGroupCommandFactory::create_command(
+            cgroup_config,
             pid,
             &process_path,
             process_args.into_iter(),
             limits,
-        )?;
+        )
+        .map_err(ChildInfoError::ProcessExecutionError)?;
+        Self::new_internal(pid, command, chunk_to_output, &process_path)
+    }
 
+    fn new_internal<F: Fn(Chunk) -> RESP + Send + 'static>(
+        pid: Pid,
+        mut command: Command,
+        chunk_to_output: F,
+        process_path: &str,
+    ) -> Result<Self, ChildInfoError> {
+        // consider adding ability to control env.vars
+        command
+            .current_dir(".") // consider making this configurable
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = command
             .spawn()
             .with_context(|| format!("[{}] Cannot run process - {}", pid, process_path))

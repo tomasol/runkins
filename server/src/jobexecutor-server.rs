@@ -1,7 +1,6 @@
 use childinfo::*;
 use job_executor::job_executor_server::*;
 use job_executor::*;
-use jobexecutor::cgroup::runtime::CGroupCommandFactory;
 use jobexecutor::cgroup::runtime::CGroupLimits;
 use jobexecutor::cgroup::server_config::CGroupConfig;
 use jobexecutor::cgroup::server_config::CGroupConfigBuilder;
@@ -22,13 +21,13 @@ pub mod job_executor {
 #[derive(Debug)]
 pub struct MyJobExecutor {
     child_storage: Mutex<HashMap<Pid, ChildInfo<OutputResponse, tonic::Status>>>,
-    cgroup_command_factory: CGroupCommandFactory,
+    cgroup_config: Option<CGroupConfig>,
 }
 
 impl MyJobExecutor {
-    fn new(cgroup_command_factory: CGroupCommandFactory) -> MyJobExecutor {
+    fn new(cgroup_config: Option<CGroupConfig>) -> MyJobExecutor {
         MyJobExecutor {
-            cgroup_command_factory,
+            cgroup_config,
             child_storage: Default::default(),
         }
     }
@@ -76,17 +75,25 @@ impl JobExecutor for MyJobExecutor {
             }
         };
         debug!("Assigned pid {} to the child process", pid);
-        store.insert(
-            pid,
-            ChildInfo::new(
-                pid,
-                start_req.path,
-                start_req.args,
-                Self::chunk_to_output,
-                &self.cgroup_command_factory,
-                start_req.cgroup.map(Self::construct_limits),
-            )?,
-        );
+        let child_info = if let Some(limits) = start_req.cgroup.map(Self::construct_limits) {
+            if let Some(cgroup_config) = &self.cgroup_config {
+                ChildInfo::new_with_cgroup(
+                    pid,
+                    start_req.path,
+                    start_req.args,
+                    Self::chunk_to_output,
+                    cgroup_config,
+                    limits,
+                )
+            } else {
+                return Err(tonic::Status::invalid_argument(
+                    "cgroup support is not enabled",
+                ));
+            }
+        } else {
+            ChildInfo::new(pid, start_req.path, start_req.args, Self::chunk_to_output)
+        }?;
+        store.insert(pid, child_info);
 
         Ok(Response::new(StartResponse {
             id: Some(ExecutionId { id: pid }),
@@ -224,7 +231,10 @@ fn guess_cgroup_config() -> Option<Result<CGroupConfig, CGroupConfigError>> {
         exe.parent()?.join("cgexec-rs")
     };
     trace!("Using cgexec-rs {:?}", cgexec_rs);
-    let parent_cgroup = std::env::var("PARENT_CGROUP").ok()?.into();
+    let parent_cgroup = std::env::var("PARENT_CGROUP")
+        .map_err(|_| debug!("PARENT_CGROUP not set"))
+        .ok()?
+        .into();
     trace!("Using parent_group {:?}", parent_cgroup);
     Some(CGroupConfig::new(CGroupConfigBuilder {
         cgexec_rs,
@@ -242,7 +252,7 @@ async fn run_server() -> anyhow::Result<()> {
             Some(config)
         }
         None => {
-            info!("cgroup config is not complete, cgroup functionality will be disabled");
+            info!("cgroup config is not complete, cgroup functionality is disabled");
             None
         }
         Some(Err(err)) => {
@@ -250,9 +260,11 @@ async fn run_server() -> anyhow::Result<()> {
         }
     };
 
-    let exec = MyJobExecutor::new(CGroupCommandFactory::new(cgroup_config));
+    let exec = MyJobExecutor::new(cgroup_config);
     info!("Starting gRPC server at {}", addr);
+
     Server::builder()
+        //TODO: add interceptor that logs errors
         .add_service(JobExecutorServer::new(exec))
         .serve(addr)
         .await?;
