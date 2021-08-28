@@ -1,5 +1,6 @@
 use anyhow::Context;
 use log::*;
+use std::ffi::OsStr;
 use std::process::ExitStatus;
 use std::process::Stdio;
 use thiserror::Error;
@@ -302,42 +303,52 @@ where
         Ok(())
     }
 
-    pub fn new<F: Fn(Chunk) -> RESP + Send + 'static>(
+    pub fn new<F, STR, ITER>(
         pid: Pid,
-        process_path: String,
-        process_args: Vec<String>,
+        process_path: STR,
+        process_args: ITER,
         chunk_to_output: F,
-    ) -> Result<Self, ChildInfoError> {
+    ) -> Result<Self, ChildInfoError>
+    where
+        F: Fn(Chunk) -> RESP + Send + 'static,
+        ITER: ExactSizeIterator<Item = STR>,
+        STR: AsRef<OsStr>,
+    {
         let mut command = Command::new(&process_path);
         command.args(process_args);
         Self::new_internal(pid, command, chunk_to_output, &process_path)
     }
 
-    pub fn new_with_cgroup<F: Fn(Chunk) -> RESP + Send + 'static>(
+    pub fn new_with_cgroup<F, STR, ITER>(
         pid: Pid,
-        process_path: String,
-        process_args: Vec<String>,
+        process_path: STR,
+        process_args: ITER,
         chunk_to_output: F,
         cgroup_config: &CGroupConfig,
         limits: CGroupLimits,
-    ) -> Result<Self, ChildInfoError> {
+    ) -> Result<Self, ChildInfoError>
+    where
+        F: Fn(Chunk) -> RESP + Send + 'static,
+        ITER: ExactSizeIterator<Item = STR>,
+        STR: AsRef<OsStr>,
+    {
         // construct command based on path and args
         let command = CGroupCommandFactory::create_command(
             cgroup_config,
             pid,
             &process_path,
-            process_args.into_iter(),
+            process_args,
             limits,
         )
         .map_err(ChildInfoError::ProcessExecutionError)?;
-        Self::new_internal(pid, command, chunk_to_output, &process_path)
+        Self::new_internal(pid, command, chunk_to_output, &process_path.as_ref())
     }
 
-    fn new_internal<F: Fn(Chunk) -> RESP + Send + 'static>(
+    fn new_internal<F: Fn(Chunk) -> RESP + Send + 'static, STR: AsRef<OsStr>>(
         pid: Pid,
         mut command: Command,
         chunk_to_output: F,
-        process_path: &str,
+        process_path: STR,
     ) -> Result<Self, ChildInfoError> {
         // consider adding ability to control env.vars
         command
@@ -347,7 +358,7 @@ where
             .stderr(Stdio::piped());
         let mut child = command
             .spawn()
-            .with_context(|| format!("[{}] Cannot run process - {}", pid, process_path))
+            .with_context(|| format!("[{}] Cannot run process - {:?}", pid, process_path.as_ref()))
             .map_err(ChildInfoError::CannotRunProcess)?;
 
         let stdout = child

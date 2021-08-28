@@ -1,5 +1,6 @@
 use std::io::Write;
 
+use anyhow::bail;
 use job_executor::job_executor_client::*;
 use job_executor::*;
 use log::*;
@@ -20,6 +21,13 @@ enum Subcommand {
         memory_max: Option<u64>,
         #[structopt(long)]
         memory_swap_max: Option<u64>,
+
+        // #[structopt(long, parse(try_from_str = parse_hex))]
+        // cpu_max: Option<([u64; 2])>,
+        #[structopt(long)]
+        cpu_max_quota_micros: Option<u64>,
+        #[structopt(long)]
+        cpu_max_period_micros: Option<u64>,
 
         path: String,
         #[structopt()]
@@ -59,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-async fn exec_cli(opt: Subcommand) -> Result<(), Box<dyn std::error::Error>> {
+async fn exec_cli(opt: Subcommand) -> anyhow::Result<()> {
     // TODO low: make this configurable
     let mut client = JobExecutorClient::connect("http://[::1]:50051").await?;
 
@@ -69,6 +77,8 @@ async fn exec_cli(opt: Subcommand) -> Result<(), Box<dyn std::error::Error>> {
             args,
             memory_max,
             memory_swap_max,
+            cpu_max_quota_micros,
+            cpu_max_period_micros,
         } => {
             let cgroup = if memory_max.is_some() || memory_swap_max.is_some() {
                 let cgroup = CGroup {
@@ -76,10 +86,22 @@ async fn exec_cli(opt: Subcommand) -> Result<(), Box<dyn std::error::Error>> {
                         memory_max,
                         memory_swap_max,
                     }),
-                    ..Default::default()
+                    cpu_limit: match (cpu_max_quota_micros, cpu_max_period_micros) {
+                        (Some(cpu_max_quota_micros), Some(cpu_max_period_micros)) => {
+                            Some(CpuLimit {
+                                cpu_max_quota_micros,
+                                cpu_max_period_micros,
+                            })
+                        }
+                        (None, None) => None,
+                        _ => {
+                            bail!(
+                                "cpu_max_quota_micros and cpu_max_period_micros must be both set"
+                            );
+                        }
+                    },
+                    block_device_limit: None, // TODO
                 };
-
-                // TODO cpu, io
 
                 Some(cgroup)
             } else {

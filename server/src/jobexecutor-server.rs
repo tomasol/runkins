@@ -47,6 +47,12 @@ impl MyJobExecutor {
 
     fn construct_limits(request_cgroup: CGroup) -> CGroupLimits {
         let mut limits = CGroupLimits {
+            cpu_limit: request_cgroup
+                .cpu_limit
+                .map(|cpu| jobexecutor::cgroup::runtime::CpuLimit {
+                    cpu_max_quota_micros: cpu.cpu_max_quota_micros,
+                    cpu_max_period_micros: cpu.cpu_max_period_micros,
+                }),
             ..Default::default()
         };
         if let Some(memory) = request_cgroup.memory_limit {
@@ -80,7 +86,7 @@ impl JobExecutor for MyJobExecutor {
                 ChildInfo::new_with_cgroup(
                     pid,
                     start_req.path,
-                    start_req.args,
+                    start_req.args.into_iter(),
                     Self::chunk_to_output,
                     cgroup_config,
                     limits,
@@ -91,7 +97,12 @@ impl JobExecutor for MyJobExecutor {
                 ));
             }
         } else {
-            ChildInfo::new(pid, start_req.path, start_req.args, Self::chunk_to_output)
+            ChildInfo::new(
+                pid,
+                start_req.path,
+                start_req.args.into_iter(),
+                Self::chunk_to_output,
+            )
         }?;
         store.insert(pid, child_info);
 
@@ -246,10 +257,25 @@ async fn run_server() -> anyhow::Result<()> {
     // TODO low: make this configurable
     let addr = "[::1]:50051".parse()?;
     let cgroup_config = match guess_cgroup_config() {
-        Some(Ok(config)) => {
+        Some(Ok(cgroup_config)) => {
             info!("cgroup support enabled");
-            trace!("cgroup config {:?}", config);
-            Some(config)
+            trace!("cgroup config {:?}", cgroup_config);
+            /* TODO permission check
+            // run `echo 123` to check whether cgroup permissions are correct
+            let limits = CGroupLimits {
+                memory_swap_max: Some(0),
+                ..Default::default()
+            };
+            ChildInfo::<(), ()>::new_with_cgroup(
+                1,
+                "echo",
+                vec![],
+                |_| (),
+                &cgroup_config,
+                limits,
+            )?; // TODO wait and remove
+            */
+            Some(cgroup_config)
         }
         None => {
             info!("cgroup config is not complete, cgroup functionality is disabled");

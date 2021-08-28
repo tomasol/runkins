@@ -100,16 +100,16 @@ pub mod runtime {
         /// Create new [`Command`] using program name and arguments.
         /// If cgroup_config is set to support cgroup, new cgroup will
         /// be created no matter if limits are provided or not.
-        pub fn create_command<I, S>(
+        pub fn create_command<ITER, STR>(
             cgroup_config: &CGroupConfig,
             pid: Pid,
-            program: &S,
-            args: I,
+            program: &STR,
+            args: ITER,
             limits: CGroupLimits,
         ) -> Result<Command, CGroupCommandError>
         where
-            I: ExactSizeIterator<Item = S>,
-            S: AsRef<OsStr>,
+            ITER: ExactSizeIterator<Item = STR>,
+            STR: AsRef<OsStr>,
         {
             let child_cgroup_path = cgroup_config
                 .create_child_cgroup(pid)
@@ -136,11 +136,11 @@ pub mod runtime {
         }
     }
 
-    // #[derive(Debug)]
-    // pub struct CpuLimit {
-    //     pub cpu_max_quota_micros: u64,
-    //     pub cpu_max_period_micros: u64,
-    // }
+    #[derive(Debug)]
+    pub struct CpuLimit {
+        pub cpu_max_quota_micros: u64,
+        pub cpu_max_period_micros: u64,
+    }
 
     // TODO BlockDeviceLimit
 
@@ -148,7 +148,7 @@ pub mod runtime {
     pub struct CGroupLimits {
         pub memory_max: Option<u64>,
         pub memory_swap_max: Option<u64>,
-        // pub cpu_limit: Option<CpuLimit>,
+        pub cpu_limit: Option<CpuLimit>,
     }
 
     impl CGroupLimits {
@@ -158,6 +158,16 @@ pub mod runtime {
             }
             if let Some(memory_swap_max) = self.memory_swap_max {
                 Self::write_numeric_limit(child_cgroup, "memory.swap.max", memory_swap_max)?;
+            }
+            if let Some(cpu_limit) = &self.cpu_limit {
+                Self::write_limit(
+                    child_cgroup,
+                    "cpu.max",
+                    format!(
+                        "{} {}",
+                        cpu_limit.cpu_max_quota_micros, cpu_limit.cpu_max_period_micros
+                    ),
+                )?;
             }
             Ok(())
         }
