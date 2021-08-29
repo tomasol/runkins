@@ -219,6 +219,8 @@ impl JobExecutor for MyJobExecutor {
         // Only allow removing finished processes
         match child_info.status().await {
             Ok(Some(_)) => {
+                // clean up cgroup
+                child_info.clean_up().await?;
                 let removed = child_storage.remove(&pid);
                 assert!(
                     removed.is_some(),

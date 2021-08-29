@@ -19,6 +19,7 @@ use crate::cgroup::runtime::CGroupCommandError;
 use crate::cgroup::runtime::CGroupCommandFactory;
 use crate::cgroup::runtime::CGroupLimits;
 use crate::cgroup::server_config::CGroupConfig;
+use crate::cgroup::server_config::ChildCGroup;
 
 #[derive(Error, Debug)]
 pub enum ChildInfoError {
@@ -57,6 +58,7 @@ enum ActorEvent<RESP, ERR> {
 pub struct ChildInfo<RESP, ERR> {
     pid: Pid,
     actor_tx: UnboundedSender<ActorEvent<RESP, ERR>>,
+    child_cgroup: Option<ChildCGroup>,
 }
 
 #[derive(Debug, Clone)]
@@ -316,7 +318,7 @@ where
     {
         let mut command = Command::new(&process_path);
         command.args(process_args);
-        Self::new_internal(pid, command, chunk_to_output, &process_path)
+        Self::new_internal(pid, command, chunk_to_output, &process_path, None)
     }
 
     pub fn new_with_cgroup<F, STR, ITER>(
@@ -333,7 +335,7 @@ where
         STR: AsRef<OsStr>,
     {
         // construct command based on path and args
-        let command = CGroupCommandFactory::create_command(
+        let (command, child_cgroup) = CGroupCommandFactory::create_command(
             cgroup_config,
             pid,
             &process_path,
@@ -341,7 +343,13 @@ where
             limits,
         )
         .map_err(ChildInfoError::ProcessExecutionError)?;
-        Self::new_internal(pid, command, chunk_to_output, &process_path.as_ref())
+        Self::new_internal(
+            pid,
+            command,
+            chunk_to_output,
+            &process_path.as_ref(),
+            Some(child_cgroup),
+        )
     }
 
     fn new_internal<F: Fn(Chunk) -> RESP + Send + 'static, STR: AsRef<OsStr>>(
@@ -349,6 +357,7 @@ where
         mut command: Command,
         chunk_to_output: F,
         process_path: STR,
+        child_cgroup: Option<ChildCGroup>,
     ) -> Result<Self, ChildInfoError> {
         // consider adding ability to control env.vars
         command
@@ -388,7 +397,11 @@ where
                 ChildInfo::std_forwarder(pid, tx, BufReader::new(stderr), StdStream::StdErr).await;
             });
         }
-        Ok(ChildInfo { pid, actor_tx: tx })
+        Ok(ChildInfo {
+            pid,
+            actor_tx: tx,
+            child_cgroup,
+        })
     }
 
     pub async fn status(&self) -> Result<Option<ExitStatus>, ChildInfoError> {
@@ -423,6 +436,14 @@ where
             Err(_) => Err(ChildInfoError::MainActorFinished(
                 "Error while stopping the job".to_string(),
             )),
+        }
+    }
+
+    pub async fn clean_up(&self) -> std::io::Result<()> {
+        if let Some(child_cgroup) = &self.child_cgroup {
+            child_cgroup.clean_up().await
+        } else {
+            Ok(())
         }
     }
 }

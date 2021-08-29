@@ -83,6 +83,15 @@ pub mod server_config {
         pub fn as_path(&self) -> &Path {
             self.path.as_path()
         }
+
+        pub async fn clean_up(&self) -> io::Result<()> {
+            debug!("Deleting {:?}", &self.path);
+            // TODO low: this will fail if the child process forked
+            tokio::fs::remove_dir(&self.path).await.map_err(|err| {
+                error!("Cannot remove cgroup {:?} - {}", &self.path, err);
+                err
+            })
+        }
     }
 }
 
@@ -115,33 +124,33 @@ pub mod runtime {
             program: &STR,
             args: ITER,
             limits: CGroupLimits,
-        ) -> Result<Command, CGroupCommandError>
+        ) -> Result<(Command, ChildCGroup), CGroupCommandError>
         where
             ITER: ExactSizeIterator<Item = STR>,
             STR: AsRef<OsStr>,
         {
-            let child_cgroup_path = cgroup_config
+            let child_cgroup = cgroup_config
                 .create_child_cgroup(pid)
                 .map_err(CGroupCommandError::CGroupCreationFailed)?;
             trace!(
                 "[{}] Configuring {:?} in cgroup {:?}",
                 pid,
                 limits,
-                child_cgroup_path
+                child_cgroup
             );
             limits
-                .write(&child_cgroup_path, cgroup_config)
+                .write(&child_cgroup, cgroup_config)
                 .map_err(CGroupCommandError::WritingCGroupConfigurationFailed)?;
             let mut command = Command::new(cgroup_config.cgexec_rs());
             // first argument is the cgroup name
             let mut new_args = Vec::with_capacity(args.len() + 2);
-            new_args.push(child_cgroup_path.as_os_string().to_owned());
+            new_args.push(child_cgroup.as_os_string().to_owned());
             // second is the program name
             new_args.push(program.as_ref().to_owned());
             new_args.extend(args.map(|item| item.as_ref().to_owned()));
             trace!("[{}] Running cgexec-rs with args {:?}", pid, new_args);
             command.args(new_args);
-            Ok(command)
+            Ok((command, child_cgroup))
         }
     }
 
