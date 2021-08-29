@@ -38,16 +38,14 @@ pub enum ChildInfoError {
 }
 
 /// Type of the writable part of a mpsc channel for streaming output chunks to a client.
-/// RESP is a type that represents the output, ERR is not used internally.
 // TODO low: add Display trait for showing IP:port of the client
-type ClientTx<RESP, ERR> =
-    UnboundedSender<Result<RESP /* type of output response */, ERR /* not used here */>>;
+type ClientTx<OUTPUT> = UnboundedSender<OUTPUT>;
 pub type Pid = u64;
 
 #[derive(Debug)]
-enum ActorEvent<RESP, ERR> {
+enum ActorEvent<OUTPUT> {
     ChunkAdded(Chunk),                            // sent by std_forwarder
-    ClientAdded(ClientTx<RESP, ERR>),             // send by API call
+    ClientAdded(ClientTx<OUTPUT>),                // send by API call
     ProcessFinished(std::io::Result<ExitStatus>), // internal to main_actor
     StatusRequest(Sender<RunningState>),          // send by API call
     KillRequest(Sender<std::io::Result<()>>),     // send by API call
@@ -55,9 +53,9 @@ enum ActorEvent<RESP, ERR> {
 }
 
 #[derive(Debug)]
-pub struct ChildInfo<RESP, ERR> {
+pub struct ChildInfo<OUTPUT> {
     pid: Pid,
-    actor_tx: UnboundedSender<ActorEvent<RESP, ERR>>,
+    actor_tx: UnboundedSender<ActorEvent<OUTPUT>>,
     child_cgroup: Option<ChildCGroup>,
 }
 
@@ -92,14 +90,13 @@ pub enum StdStream {
 /// ChildInfo represents the started process, its state, output and all associated data.
 /// It starts several async tasks to keep track of the output and running status.
 /// Note about generic types:
-/// RESP is a type that represents the output, ERR is not used internally.
-/// Both types are used for streaming the output via mpsc channel, see ClientTx type.
-impl<RESP, ERR> ChildInfo<RESP, ERR>
+/// OUTPUT is a type that represents the message written to a channel
+/// when streaming the output, see ClientTx type.
+impl<OUTPUT> ChildInfo<OUTPUT>
 where
-    RESP: std::fmt::Debug + Send + 'static,
-    ERR: std::fmt::Debug + Send + 'static,
+    OUTPUT: std::fmt::Debug + Send + 'static,
 {
-    pub fn add_client(&self, client_tx: ClientTx<RESP, ERR>) -> Result<(), ChildInfoError> {
+    pub fn add_client(&self, client_tx: ClientTx<OUTPUT>) -> Result<(), ChildInfoError> {
         self.actor_tx
             .send(ActorEvent::ClientAdded(client_tx))
             .map_err(|err| {
@@ -112,7 +109,7 @@ where
     // to the provided event sender of main_actor.
     async fn std_forwarder<T: AsyncRead + std::marker::Unpin>(
         pid: Pid,
-        tx: UnboundedSender<ActorEvent<RESP, ERR>>,
+        tx: UnboundedSender<ActorEvent<OUTPUT>>,
         mut buf_reader: BufReader<T>,
         std_stream: StdStream,
     ) {
@@ -160,15 +157,15 @@ where
         }
     }
 
-    async fn main_actor<F: Fn(Chunk) -> RESP>(
+    async fn main_actor<F: Fn(Chunk) -> OUTPUT>(
         pid: Pid,
-        mut rx: UnboundedReceiver<ActorEvent<RESP, ERR>>,
+        mut rx: UnboundedReceiver<ActorEvent<OUTPUT>>,
         mut child: Child,
         chunk_to_output: F,
     ) {
         debug!("[{}] actor started", pid);
         let mut chunks: Vec<Chunk> = vec![];
-        let mut clients: Vec<ClientTx<RESP, ERR>> = vec![];
+        let mut clients: Vec<ClientTx<OUTPUT>> = vec![];
         let mut running_state = RunningState::Running; // used for StatusRequest reporting
         let mut stream_finished_event_count = 0; // chunks is complete only when both events are received
 
@@ -271,9 +268,9 @@ where
     }
 
     // send everything to this client. This might be a bottleneck if many clients start connecting.
-    fn send_everything<F: Fn(Chunk) -> RESP>(
+    fn send_everything<F: Fn(Chunk) -> OUTPUT>(
         pid: Pid,
-        client_tx: &ClientTx<RESP, ERR>,
+        client_tx: &ClientTx<OUTPUT>,
         chunks: &[Chunk],
         chunk_to_output: &F,
     ) -> Result<(), ()> {
@@ -283,9 +280,9 @@ where
         Ok(())
     }
 
-    fn send_line<F: Fn(Chunk) -> RESP>(
+    fn send_line<F: Fn(Chunk) -> OUTPUT>(
         pid: Pid,
-        client_tx: &ClientTx<RESP, ERR>,
+        client_tx: &ClientTx<OUTPUT>,
         chunk: Chunk,
         chunk_to_output: &F,
     ) -> Result<(), ()> {
@@ -296,7 +293,7 @@ where
             client_tx
         );
         let output_response = chunk_to_output(chunk);
-        client_tx.send(Ok(output_response)).map_err(|err| {
+        client_tx.send(output_response).map_err(|err| {
             warn!(
                 "[{}] Cannot send chunk to client {:?} - {}",
                 pid, client_tx, err
@@ -312,7 +309,7 @@ where
         chunk_to_output: F,
     ) -> Result<Self, ChildInfoError>
     where
-        F: Fn(Chunk) -> RESP + Send + 'static,
+        F: Fn(Chunk) -> OUTPUT + Send + 'static,
         ITER: ExactSizeIterator<Item = STR>,
         STR: AsRef<OsStr>,
     {
@@ -330,7 +327,7 @@ where
         limits: CGroupLimits,
     ) -> Result<Self, ChildInfoError>
     where
-        F: Fn(Chunk) -> RESP + Send + 'static,
+        F: Fn(Chunk) -> OUTPUT + Send + 'static,
         ITER: ExactSizeIterator<Item = STR>,
         STR: AsRef<OsStr>,
     {
@@ -352,7 +349,7 @@ where
         )
     }
 
-    fn new_internal<F: Fn(Chunk) -> RESP + Send + 'static, STR: AsRef<OsStr>>(
+    fn new_internal<F: Fn(Chunk) -> OUTPUT + Send + 'static, STR: AsRef<OsStr>>(
         pid: Pid,
         mut command: Command,
         chunk_to_output: F,

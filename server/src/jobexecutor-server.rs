@@ -20,7 +20,7 @@ pub mod job_executor {
 
 #[derive(Debug)]
 pub struct MyJobExecutor {
-    child_storage: Mutex<HashMap<Pid, ChildInfo<OutputResponse, tonic::Status>>>,
+    child_storage: Mutex<HashMap<Pid, ChildInfo<Result<OutputResponse, tonic::Status>>>>,
     cgroup_config: Option<CGroupConfig>,
 }
 
@@ -32,8 +32,8 @@ impl MyJobExecutor {
         }
     }
 
-    fn chunk_to_output(chunk: Chunk) -> OutputResponse {
-        match chunk {
+    fn chunk_to_output(chunk: Chunk) -> Result<OutputResponse, tonic::Status> {
+        Ok(match chunk {
             Chunk::StdOut(str) => OutputResponse {
                 std_out_chunk: Some(OutputChunk { chunk: str }),
                 std_err_chunk: None,
@@ -42,7 +42,7 @@ impl MyJobExecutor {
                 std_out_chunk: None,
                 std_err_chunk: Some(OutputChunk { chunk: str }),
             },
-        }
+        })
     }
 
     fn construct_limits(request_cgroup: CGroup) -> CGroupLimits {
