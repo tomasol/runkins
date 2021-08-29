@@ -20,30 +20,32 @@ enum Subcommand {
         #[structopt(short, long, help = "Enable cgroup limits")]
         limits: bool,
         // memory.max
-        #[structopt(long, help = "Set memory.max in bytes")]
+        #[structopt(long, help = "Set memory.max in bytes", requires("limits"))]
         memory_max: Option<u64>,
         // memory.swap.max
-        #[structopt(long, help = "Set memory.swap.max in bytes")]
+        #[structopt(long, help = "Set memory.swap.max in bytes", requires("limits"))]
         memory_swap_max: Option<u64>,
-        // cpu.max: both values must be set
+        // cpu.max: none or both values must be set
         #[structopt(
             long,
-            help = "Set cpu.max, quota part, both parts must be set together"
+            help = "Set cpu.max, quota part, both parts must be set together",
+            requires("limits")
         )]
         cpu_max_quota_micros: Option<u64>,
         #[structopt(
             long,
-            help = "Set cpu.max, period part, both parts must be set together"
+            help = "Set cpu.max, period part, both parts must be set together",
+            requires("limits")
         )]
         cpu_max_period_micros: Option<u64>,
         // io.max: not all values must be set
-        #[structopt(long, help = "Set io.max, rbps value")]
+        #[structopt(long, help = "Set io.max, rbps value", requires("limits"))]
         io_max_rbps: Option<u64>,
-        #[structopt(long, help = "Set io.max, riops value")]
+        #[structopt(long, help = "Set io.max, riops value", requires("limits"))]
         io_max_riops: Option<u64>,
-        #[structopt(long, help = "Set io.max, wbps value")]
+        #[structopt(long, help = "Set io.max, wbps value", requires("limits"))]
         io_max_wbps: Option<u64>,
-        #[structopt(long, help = "Set io.max, wiops value")]
+        #[structopt(long, help = "Set io.max, wiops value", requires("limits"))]
         io_max_wiops: Option<u64>,
 
         path: String,
