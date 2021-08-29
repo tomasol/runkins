@@ -2,6 +2,8 @@
 Switches to the target cgroup and `exec`s the supplied command.
 Based on libcgroup's cgexec.
 
+This document assumes that the unified cgroup hierarchy is mouted at `/sys/fs/cgroup`.
+
 ## Usage
 ```sh
 cgexec absolute-path-to-target-cgroup command <args>
@@ -12,8 +14,9 @@ The binary can be run either using `cargo run --bin cgexec-bin` or
 executing the binary in `target` folder if it was already built by cargo.
 
 ### Setting up cgroup v2 with systemd-run
-In order to manage cgroup by non-root users,
-[enable controller delegation](https://rootlesscontaine.rs/getting-started/common/cgroup2/)
+Systemd only allows managing following controllers by non-root users: `memory pids`.
+This can be avoided by
+[enabling controller delegation](https://rootlesscontaine.rs/getting-started/common/cgroup2/).
 
 Verify that the delegation is enabled:
 ```sh
@@ -21,65 +24,82 @@ $ cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup
 ```
 The needed controllers are `cpu memory io` . Follow the guide above if any of them are missing.
 
-## Testing
-We are assuming that the unified cgroup hierarchy is mouted at `/sys/fs/cgroup`.
-
 Start new shell in a new systemd slice:
 ```sh
 $ systemd-run --user -p Delegate=yes --slice=my.slice --shell
 ```
+Do not close this shell.
 
 Inside this shell, examine the current cgroup:
 ```sh
 $ cat /proc/self/cgroup
 0::/user.slice/user-1000.slice/user@1000.service/my.slice/run-u690.service
-$ PARENT_CGROUP=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/my.slice
-```
 
-The shell in this example lives in the leaf `run-u690.service`.
-
-Create new cgroup `TARGET_CGROUP` under the `PARENT_CGROUP`, verify all required controllers are available:
-```sh
-$ TARGET_CGROUP=$PARENT_CGROUP/temporary
-$ mkdir $TARGET_CGROUP
-$ cat $TARGET_CGROUP/cgroup.controllers
+# cd to my.slice
+$ cd /sys/fs/cgroup/$(cat /proc/self/cgroup | cut -d ':' -f 3)/..
+$ cat cgroup.subtree_control
 cpu io memory pids
+$ mkdir cgexec-rs-testing
+```
+Set up environment variables.
+```sh
+# PARENT_CGROUP will be required when running the server
+export PARENT_CGROUP=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/my.slice
+export TARGET_CGROUP=$PARENT_CGROUP/cgexec-rs-testing
 ```
 
-Optionally modify limits e.g.:
+### Manually creating cgroup
+
+To manually create a cgroup using root account:
+```sh
+$ export PARENT_CGROUP=/sys/fs/cgroup/my-parent
+$ export TARGET_CGROUP=$PARENT_CGROUP/cgexec-rs-testing
+$ mkdir $PARENT_CGROUP
+```
+Verify that `cgroup.subtree_control` and
+`cgroup.controllers` contain all required controllers.
+If some are missing, add them:
+```sh
+$ echo '+cpu +memory +io' > cgroup.subtree_control
+$ cat cgroup.subtree_control
+cpu io memory
+
+```
+Finally add a target cgroup folder.
+```sh
+$ mkdir $TARGET_CGROUP
+```
+Verify that `cgroup.controllers` is correct.
+
+### Executing cgexec-rs
+Optionally modify limits in `TARGET_CGROUP`:
 ```sh
 echo 0 > $TARGET_CGROUP/memory.swap.max
 echo 50000000 > $TARGET_CGROUP/memory.max
 ```
 
 Run `cgexec-rs` with a command that should be attached to the `TARGET_CGROUP` cgroup. This can be done from inside or outside the `systemd-run` shell.
-```
-$ cgexec-rs $TARGET_CGROUP cat /proc/self/cgroup
-0::/user.slice/user-1000.slice/user@1000.service/my.slice/temporary
-```
 
-# Troubleshooting
-
-## Verifying delegation and fixing cgroup.subtree_control
-
-Start new shell in a new systemd slice:
+Verify that the executed process `cat` lives in the target cgroup:
 ```sh
-$ systemd-run --user -p Delegate=yes --slice=temp1.slice --shell
+$ cargo run --bin cgexec-rs $TARGET_CGROUP cat /proc/self/cgroup
+0::/user.slice/user-1000.slice/user@1000.service/my.slice/cgexec-rs-testing
 ```
-Inside this shell, examine the current cgroup:
+Verify that all required controllers `cpu io memory` are available:
 ```sh
-$ cat /proc/self/cgroup
-0::/user.slice/user-1000.slice/user@1000.service/my.slice/run-u690.service
-```
-Verify that `cgroup.controller` has all required controllers:
-```sh
-$ cat /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/cgroup.subtree_control
-memory pids
-```
-If some controllers are missing, go up the hierarchy and add them to `cgroup.subtree_control`.
-```sh
-$ echo +cpu > /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/cgroup.subtree_control
-$ echo +io > /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/cgroup.subtree_control
-$ cat /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/cgroup.subtree_control
+$ cargo run --bin cgexec-rs $TARGET_CGROUP sh -c 'cat /sys/fs/cgroup/$(cat /proc/self/cgroup | cut -d ':' -f 3)/cgroup.controllers'
 cpu io memory pids
 ```
+Finally, remove the `TARGET_CGROUP`:
+```sh
+rmdir $TARGET_CGROUP
+```
+
+
+## Resources
+https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html
+https://systemd.io/CGROUP_DELEGATION/
+https://wiki.archlinux.org/title/cgroups
+https://www.redhat.com/sysadmin/cgroups-part-four
+https://linux.die.net/man/1/cgexec
+https://github.com/libcgroup/libcgroup

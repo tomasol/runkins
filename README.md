@@ -1,7 +1,7 @@
 # jobexecutor
 
 Folder structure:
-* cgexec-rs - binary `cgexec-rs` - based on `cgexec` [doc](https://linux.die.net/man/1/cgexec) [src](https://github.com/libcgroup/libcgroup/blob/main/src/tools/cgexec.c), used by the server
+* cgexec-rs - binary `cgexec-rs` - used by the server to switch cgroup
 * cli - binary `jobexecutor-cli` - CLI
 * jobexecutor - library used by the server
 * proto - `*.proto` definition
@@ -16,7 +16,8 @@ For cgroup functionality (required when running a process with limits set):
 * cgroup v2 enabled
 * `systemd --version` >= 244 for cgroup v2 controller delegation to non-root users. This can be worked around e.g. by running as root.
 
-More information can be found in **cgroup** section and in [cgexec-rs](cgexec-rs/README.md) .
+More information can be found in the **cgroup** section.
+
 ### cargo build
 To create a debug build of all components run
 ```sh
@@ -73,35 +74,80 @@ should be `Exited with code 0`.
 To test different exit codes,
 use `slow 1 3`, which will end with status `Exited with code 3`.
 
-Killing the `slow` process using `killall slow` should end with status `Exited with signal`.
-
+Killing the `slow` process using `killall slow` or `stop` RPC should end with status `Exited with signal`.
 
 ### Automated testing
 Not implemented yet.
 
+## cgroup support
+Please read [cgexec-rs](cgexec-rs/README.md) and verify it is working as described.
 
-## cgroup
-Currently not implemented.
+Following environment variables need to be set, otherwise cgroup support will not be enabled.
+* PARENT_CGROUP - full path to a cgroup directory that can be written by the current user
+* CGROUP_BLOCK_DEVICE_ID - in form of MAJOR:MINOR, see `lsblk`
+* CGEXEC_RS - path to cgexec-rs binary, might be omitted if it lives in the same folder as `jobexecutor-server`
 
-To check that cgroup v2 is enabled and the required controllers (`memory`, `cpu`, `io`)
-can be delegated, follow this [guide](https://rootlesscontaine.rs/getting-started/common/cgroup2/)
+If the parent cgroup is created using `systemd-run`, make sure the shell is still open.
 
-To manually create a cgroup:
+Verify that the process runs in its own cgroup:
 ```sh
-mkdir /sys/fs/cgroup/cg1
-echo 0 > /sys/fs/cgroup/cg1/memory.swap.max
-echo 10000000 > /sys/fs/cgroup/cg1/memory.max
-echo $PID >> /sys/fs/cgroup/cg1/cgroup.procs
-```
-To use `cgexec-rs`:
-```sh
-./target/debug/cgexec-rs /sys/fs/cgroup/cg1 sleep infinity
+# note the --limits flag - if not set, cgroup will not be created
+$ EID=$(cargo run --bin jobexecutor-cli start --limits -- cat /proc/self/cgroup)
+$ cargo run --bin jobexecutor-cli output $EID
+0::/user.slice/user-1000.slice/user@1000.service/my.slice/15395846019127741322
+$ cargo run --bin jobexecutor-cli remove $EID
 ```
 
-TODO:
-* permissions
-* creation
-* cleanup (kill all pids, then cgroup)
+Verify that all required controllers `cpu io memory` are available:
+```sh
+$ EID=$(cargo run --bin jobexecutor-cli start --limits -- \
+ sh -c 'cat /sys/fs/cgroup/$(cat /proc/self/cgroup | cut -d ':' -f 3)/cgroup.controllers')
+$ cargo run --bin jobexecutor-cli output $EID
+cpu io memory pids
+$ cargo run --bin jobexecutor-cli remove $EID
+```
+
+### Setting cgroup limits via CLI
+Switches for limits can be discovered using help.
+```sh
+$ cargo run --bin jobexecutor-cli start --help
+jobexecutor-cli-start 0.1.0
+
+USAGE:
+    jobexecutor-cli start [FLAGS] [OPTIONS] <path> [args]...
+
+FLAGS:
+    -h, --help       Prints help information
+    -l, --limits     Enable cgroup limits
+    -V, --version    Prints version information
+
+OPTIONS:
+        --cpu-max-period-micros <cpu-max-period-micros>    Set cpu.max, period part, both parts must be set together
+        --cpu-max-quota-micros <cpu-max-quota-micros>      Set cpu.max, quota part, both parts must be set together
+        --io-max-rbps <io-max-rbps>                        Set io.max, rbps value
+        --io-max-riops <io-max-riops>                      Set io.max, riops value
+        --io-max-wbps <io-max-wbps>                        Set io.max, wbps value
+        --io-max-wiops <io-max-wiops>                      Set io.max, wiops value
+        --memory-max <memory-max>                          Set memory.max in bytes
+        --memory-swap-max <memory-swap-max>                Set memory.swap.max in bytes
+
+ARGS:
+    <path>
+    <args>...
+```
+Note that `--limits` flag must be set, otherwise the CLI will complain.
+
+Example:
+```sh
+# this should succeed:
+$ EID=$(cargo run --bin jobexecutor-cli start \
+ --limits --memory-max 1000000 --memory-swap-max 0 -- \
+  bash --help)
+# this should exit with signal:
+$ EID=$(cargo run --bin jobexecutor-cli start \
+ --limits --memory-max 100000 --memory-swap-max 0 -- \
+  bash --help)
+```
 
 ## mTLS
 Currently not implemented.
