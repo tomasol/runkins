@@ -22,13 +22,14 @@ pub mod server_config {
     pub struct CGroupConfigBuilder {
         pub parent_cgroup: PathBuf,
         pub cgexec_rs: PathBuf,
+        pub cgroup_block_device_id: String,
     }
 
-    /// Avoid flipping the arguments in fn new
     #[derive(Debug, Clone)]
     pub struct CGroupConfig {
         parent_cgroup: PathBuf,
         cgexec_rs: PathBuf,
+        cgroup_block_device_id: String,
     }
 
     impl CGroupConfig {
@@ -43,6 +44,7 @@ pub mod server_config {
                 Ok(CGroupConfig {
                     parent_cgroup,
                     cgexec_rs,
+                    cgroup_block_device_id: builder.cgroup_block_device_id,
                 })
             }
         }
@@ -51,10 +53,17 @@ pub mod server_config {
             &self.cgexec_rs
         }
 
+        pub fn cgroup_block_device_id(&self) -> &str {
+            &self.cgroup_block_device_id
+        }
+
         pub fn create_child_cgroup(&self, pid: Pid) -> io::Result<ChildCGroup> {
             let path = self.parent_cgroup.join(pid.to_string());
             trace!("[{}] Creating child cgroup {:?}", pid, path);
-            fs::create_dir(path.clone())?;
+            fs::create_dir(path.clone()).map_err(|err| {
+                error!("[{}] Cannot create child cgroup {:?} - {}", pid, path, err);
+                err
+            })?;
             Ok(ChildCGroup { path })
         }
     }
@@ -121,7 +130,7 @@ pub mod runtime {
                 child_cgroup_path
             );
             limits
-                .write(&child_cgroup_path)
+                .write(&child_cgroup_path, cgroup_config)
                 .map_err(CGroupCommandError::WritingCGroupConfigurationFailed)?;
             let mut command = Command::new(cgroup_config.cgexec_rs());
             // first argument is the cgroup name
@@ -142,17 +151,30 @@ pub mod runtime {
         pub cpu_max_period_micros: u64,
     }
 
-    // TODO BlockDeviceLimit
+    #[derive(Debug)]
+    pub struct BlockDeviceLimit {
+        pub io_max_rbps: Option<u64>,
+        pub io_max_riops: Option<u64>,
+        pub io_max_wbps: Option<u64>,
+        pub io_max_wiops: Option<u64>,
+    }
 
     #[derive(Debug, Default)]
     pub struct CGroupLimits {
         pub memory_max: Option<u64>,
         pub memory_swap_max: Option<u64>,
         pub cpu_limit: Option<CpuLimit>,
+        pub block_device_limit: Option<BlockDeviceLimit>,
     }
 
     impl CGroupLimits {
-        fn write(&self, child_cgroup: &ChildCGroup) -> anyhow::Result<()> {
+        /// Write limits to various files inside child_cgroup folder.
+        /// See https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html
+        fn write(
+            &self,
+            child_cgroup: &ChildCGroup,
+            cgroup_config: &CGroupConfig,
+        ) -> anyhow::Result<()> {
             if let Some(memory_max) = self.memory_max {
                 Self::write_numeric_limit(child_cgroup, "memory.max", memory_max)?;
             }
@@ -168,6 +190,26 @@ pub mod runtime {
                         cpu_limit.cpu_max_quota_micros, cpu_limit.cpu_max_period_micros
                     ),
                 )?;
+            }
+            if let Some(block_device_limit) = &self.block_device_limit {
+                let mut io_max_buf = String::new();
+                if let Some(num) = block_device_limit.io_max_rbps {
+                    io_max_buf += &format!("rbps={} ", num);
+                }
+                if let Some(num) = block_device_limit.io_max_riops {
+                    io_max_buf += &format!("riops={} ", num);
+                }
+                if let Some(num) = block_device_limit.io_max_wbps {
+                    io_max_buf += &format!("wbps={} ", num);
+                }
+                if let Some(num) = block_device_limit.io_max_wiops {
+                    io_max_buf += &format!("wiops={} ", num);
+                }
+                if !io_max_buf.is_empty() {
+                    io_max_buf
+                        .insert_str(0, &format!("{} ", cgroup_config.cgroup_block_device_id()));
+                    Self::write_limit(child_cgroup, "io.max", io_max_buf)?;
+                }
             }
             Ok(())
         }
@@ -189,10 +231,21 @@ pub mod runtime {
             let mut file = OpenOptions::new()
                 .write(true)
                 .open(&path)
-                .with_context(|| format!("Cannot open {:?} for writing", path))?;
-
-            file.write(content.as_ref().as_bytes())
-                .with_context(|| format!("Cannot write {:?}", path))
+                .with_context(|| format!("Cannot open {:?} for writing", path))
+                .map_err(|err| {
+                    error!("{}", err);
+                    err
+                })?;
+            let content = content.as_ref();
+            file.write(content.as_bytes())
+                .map_err(|err| {
+                    error!(
+                        "Error writing content {} to file {:?} - {}",
+                        content, path, err
+                    );
+                    err
+                })
+                .with_context(|| format!("Cannot write to file {:?}", path))
         }
     }
 }

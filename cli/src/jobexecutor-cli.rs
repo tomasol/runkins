@@ -17,17 +17,34 @@ type Pid = u64;
 enum Subcommand {
     Start {
         // TODO low: allow setting limits in human writable form e.g. 10MB, 5ms, etc.
-        #[structopt(long)]
+        #[structopt(short, long, help = "Enable cgroup limits")]
+        limits: bool,
+        // memory.max
+        #[structopt(long, help = "Set memory.max in bytes")]
         memory_max: Option<u64>,
-        #[structopt(long)]
+        // memory.swap.max
+        #[structopt(long, help = "Set memory.swap.max in bytes")]
         memory_swap_max: Option<u64>,
-
-        // #[structopt(long, parse(try_from_str = parse_hex))]
-        // cpu_max: Option<([u64; 2])>,
-        #[structopt(long)]
+        // cpu.max: both values must be set
+        #[structopt(
+            long,
+            help = "Set cpu.max, quota part, both parts must be set together"
+        )]
         cpu_max_quota_micros: Option<u64>,
-        #[structopt(long)]
+        #[structopt(
+            long,
+            help = "Set cpu.max, period part, both parts must be set together"
+        )]
         cpu_max_period_micros: Option<u64>,
+        // io.max: not all values must be set
+        #[structopt(long, help = "Set io.max, rbps value")]
+        io_max_rbps: Option<u64>,
+        #[structopt(long, help = "Set io.max, riops value")]
+        io_max_riops: Option<u64>,
+        #[structopt(long, help = "Set io.max, wbps value")]
+        io_max_wbps: Option<u64>,
+        #[structopt(long, help = "Set io.max, wiops value")]
+        io_max_wiops: Option<u64>,
 
         path: String,
         #[structopt()]
@@ -75,12 +92,17 @@ async fn exec_cli(opt: Subcommand) -> anyhow::Result<()> {
         Subcommand::Start {
             path,
             args,
+            limits,
             memory_max,
             memory_swap_max,
             cpu_max_quota_micros,
             cpu_max_period_micros,
+            io_max_rbps,
+            io_max_riops,
+            io_max_wbps,
+            io_max_wiops,
         } => {
-            let cgroup = if memory_max.is_some() || memory_swap_max.is_some() {
+            let cgroup = if limits {
                 let cgroup = CGroup {
                     memory_limit: Some(MemoryLimit {
                         memory_max,
@@ -96,11 +118,16 @@ async fn exec_cli(opt: Subcommand) -> anyhow::Result<()> {
                         (None, None) => None,
                         _ => {
                             bail!(
-                                "cpu_max_quota_micros and cpu_max_period_micros must be both set"
+                                "To control cpu.max, cpu_max_quota_micros and cpu_max_period_micros must be both set"
                             );
                         }
                     },
-                    block_device_limit: None, // TODO
+                    block_device_limit: Some(BlockDeviceLimit {
+                        io_max_rbps,
+                        io_max_riops,
+                        io_max_wbps,
+                        io_max_wiops,
+                    }),
                 };
 
                 Some(cgroup)

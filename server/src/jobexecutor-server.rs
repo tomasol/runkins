@@ -53,6 +53,14 @@ impl MyJobExecutor {
                     cpu_max_quota_micros: cpu.cpu_max_quota_micros,
                     cpu_max_period_micros: cpu.cpu_max_period_micros,
                 }),
+            block_device_limit: request_cgroup.block_device_limit.map(|io| {
+                jobexecutor::cgroup::runtime::BlockDeviceLimit {
+                    io_max_rbps: io.io_max_rbps,
+                    io_max_riops: io.io_max_riops,
+                    io_max_wbps: io.io_max_wbps,
+                    io_max_wiops: io.io_max_wiops,
+                }
+            }),
             ..Default::default()
         };
         if let Some(memory) = request_cgroup.memory_limit {
@@ -247,9 +255,16 @@ fn guess_cgroup_config() -> Option<Result<CGroupConfig, CGroupConfigError>> {
         .ok()?
         .into();
     trace!("Using parent_group {:?}", parent_cgroup);
+
+    let cgroup_block_device_id = std::env::var("CGROUP_BLOCK_DEVICE_ID")
+        .map_err(|_| debug!("CGROUP_BLOCK_DEVICE_ID not set"))
+        .ok()?;
+    trace!("Using block device {:?}", cgroup_block_device_id);
+
     Some(CGroupConfig::new(CGroupConfigBuilder {
         cgexec_rs,
         parent_cgroup,
+        cgroup_block_device_id,
     }))
 }
 
@@ -258,23 +273,7 @@ async fn run_server() -> anyhow::Result<()> {
     let addr = "[::1]:50051".parse()?;
     let cgroup_config = match guess_cgroup_config() {
         Some(Ok(cgroup_config)) => {
-            info!("cgroup support enabled");
-            trace!("cgroup config {:?}", cgroup_config);
-            /* TODO permission check
-            // run `echo 123` to check whether cgroup permissions are correct
-            let limits = CGroupLimits {
-                memory_swap_max: Some(0),
-                ..Default::default()
-            };
-            ChildInfo::<(), ()>::new_with_cgroup(
-                1,
-                "echo",
-                vec![],
-                |_| (),
-                &cgroup_config,
-                limits,
-            )?; // TODO wait and remove
-            */
+            info!("cgroup support enabled: {:?}", cgroup_config);
             Some(cgroup_config)
         }
         None => {
