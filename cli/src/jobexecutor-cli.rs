@@ -1,10 +1,11 @@
 use std::io::Write;
 
-use anyhow::bail;
+use anyhow::Context;
 use job_executor::job_executor_client::*;
 use job_executor::*;
 use log::*;
 use structopt::StructOpt;
+use tonic::transport::Channel;
 
 pub mod job_executor {
     tonic::include_proto!("jobexecutor");
@@ -29,13 +30,13 @@ enum Subcommand {
         #[structopt(
             long,
             help = "Set cpu.max, quota part, both parts must be set together",
-            requires("limits")
+            requires_all(&["limits", "cpu-max-period-micros"])
         )]
         cpu_max_quota_micros: Option<u64>,
         #[structopt(
             long,
             help = "Set cpu.max, period part, both parts must be set together",
-            requires("limits")
+            requires_all(&["limits", "cpu-max-quota-micros"])
         )]
         cpu_max_period_micros: Option<u64>,
         // io.max: not all values must be set
@@ -67,29 +68,24 @@ enum Subcommand {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> anyhow::Result<()> {
     env_logger::init();
     let opt = Subcommand::from_args();
-    let result = exec_cli(opt).await;
-    if let Err(err) = result {
-        eprintln!("CLI failed: {}", err);
-        // TODO unpack gRPC error, show only status and message
-        let mut source = err.source();
-        while let Some(source_err) = source {
-            eprintln!(" Caused by: {}", source_err);
-            source = source_err.source();
-        }
-        eprintln!("Details: {:?}", err);
-        std::process::exit(1);
-    } else {
-        Ok(())
-    }
+    // TODO low: make this configurable
+    let addr = "http://[::1]:50051";
+    let client = JobExecutorClient::connect(addr)
+        .await
+        .with_context(|| format!("Cannot connect to {}", addr))?;
+    let result = send_request(opt, client)
+        .await
+        .map_err(|err| anyhow::anyhow!("Response error: {} - {}", err.message(), err.code()));
+    result
 }
 
-async fn exec_cli(opt: Subcommand) -> anyhow::Result<()> {
-    // TODO low: make this configurable
-    let mut client = JobExecutorClient::connect("http://[::1]:50051").await?;
-
+async fn send_request(
+    opt: Subcommand,
+    mut client: JobExecutorClient<Channel>,
+) -> Result<(), tonic::Status> {
     match opt {
         Subcommand::Start {
             path,
@@ -117,12 +113,7 @@ async fn exec_cli(opt: Subcommand) -> anyhow::Result<()> {
                                 cpu_max_period_micros,
                             })
                         }
-                        (None, None) => None,
-                        _ => {
-                            bail!(
-                                "To control cpu.max, cpu_max_quota_micros and cpu_max_period_micros must be both set"
-                            );
-                        }
+                        _ => None,
                     },
                     block_device_limit: Some(BlockDeviceLimit {
                         io_max_rbps,
