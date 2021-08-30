@@ -87,7 +87,12 @@ Following environment variables need to be set, otherwise cgroup support will no
 * CGROUP_BLOCK_DEVICE_ID - in form of MAJOR:MINOR, see `lsblk`
 * CGEXEC_RS - path to cgexec-rs binary, might be omitted if it lives in the same folder as `jobexecutor-server`
 
-If the parent cgroup is created using `systemd-run`, make sure the shell is still open.
+If the parent cgroup is created using `systemd-run`, make sure the shell is still open. Example:
+```sh
+$ systemd-run --user -p Delegate=yes --slice=my.slice --shell
+# depending on the user, path might be:
+# export PARENT_CGROUP=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/my.slice
+```
 
 Verify that the process runs in its own cgroup:
 ```sh

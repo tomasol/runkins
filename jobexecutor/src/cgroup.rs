@@ -1,6 +1,8 @@
 use log::*;
-use std::{ffi::OsStr, fs, io, path::PathBuf};
+use std::{ffi::OsStr, path::PathBuf};
 use thiserror::Error;
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::childinfo::Pid;
@@ -57,10 +59,10 @@ pub mod server_config {
             &self.cgroup_block_device_id
         }
 
-        pub fn create_child_cgroup(&self, pid: Pid) -> io::Result<ChildCGroup> {
+        pub async fn create_child_cgroup(&self, pid: Pid) -> std::io::Result<ChildCGroup> {
             let path = self.parent_cgroup.join(pid.to_string());
             trace!("[{}] Creating child cgroup {:?}", pid, path);
-            fs::create_dir(path.clone()).map_err(|err| {
+            tokio::fs::create_dir(path.clone()).await.map_err(|err| {
                 error!("[{}] Cannot create child cgroup {:?} - {}", pid, path, err);
                 err
             })?;
@@ -84,7 +86,7 @@ pub mod server_config {
             self.path.as_path()
         }
 
-        pub async fn clean_up(&self) -> io::Result<()> {
+        pub async fn clean_up(&self) -> std::io::Result<()> {
             debug!("Deleting {:?}", &self.path);
             // TODO low: this will fail if the child process forked
             tokio::fs::remove_dir(&self.path).await.map_err(|err| {
@@ -101,7 +103,6 @@ pub mod runtime {
         *,
     };
     use anyhow::Context;
-    use std::{fs::OpenOptions, io::Write};
 
     #[derive(Error, Debug)]
     pub enum CGroupCommandError {
@@ -118,7 +119,7 @@ pub mod runtime {
         /// Create new [`Command`] using program name and arguments.
         /// If cgroup_config is set to support cgroup, new cgroup will
         /// be created no matter if limits are provided or not.
-        pub fn create_command<ITER, STR>(
+        pub async fn create_command<ITER, STR>(
             cgroup_config: &CGroupConfig,
             pid: Pid,
             program: &STR,
@@ -131,6 +132,7 @@ pub mod runtime {
         {
             let child_cgroup = cgroup_config
                 .create_child_cgroup(pid)
+                .await
                 .map_err(CGroupCommandError::CGroupCreationFailed)?;
             trace!(
                 "[{}] Configuring {:?} in cgroup {:?}",
@@ -140,6 +142,7 @@ pub mod runtime {
             );
             limits
                 .write(&child_cgroup, cgroup_config)
+                .await
                 .map_err(CGroupCommandError::WritingCGroupConfigurationFailed)?;
             let mut command = Command::new(cgroup_config.cgexec_rs());
             // first argument is the cgroup name
@@ -179,16 +182,16 @@ pub mod runtime {
     impl CGroupLimits {
         /// Write limits to various files inside child_cgroup folder.
         /// See https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html
-        fn write(
+        async fn write(
             &self,
             child_cgroup: &ChildCGroup,
             cgroup_config: &CGroupConfig,
         ) -> anyhow::Result<()> {
             if let Some(memory_max) = self.memory_max {
-                Self::write_numeric_limit(child_cgroup, "memory.max", memory_max)?;
+                Self::write_numeric_limit(child_cgroup, "memory.max", memory_max).await?;
             }
             if let Some(memory_swap_max) = self.memory_swap_max {
-                Self::write_numeric_limit(child_cgroup, "memory.swap.max", memory_swap_max)?;
+                Self::write_numeric_limit(child_cgroup, "memory.swap.max", memory_swap_max).await?;
             }
             if let Some(cpu_limit) = &self.cpu_limit {
                 Self::write_limit(
@@ -198,7 +201,8 @@ pub mod runtime {
                         "{} {}",
                         cpu_limit.cpu_max_quota_micros, cpu_limit.cpu_max_period_micros
                     ),
-                )?;
+                )
+                .await?;
             }
             if let Some(block_device_limit) = &self.block_device_limit {
                 let mut io_max_buf = String::new();
@@ -217,21 +221,21 @@ pub mod runtime {
                 if !io_max_buf.is_empty() {
                     io_max_buf
                         .insert_str(0, &format!("{} ", cgroup_config.cgroup_block_device_id()));
-                    Self::write_limit(child_cgroup, "io.max", io_max_buf)?;
+                    Self::write_limit(child_cgroup, "io.max", io_max_buf).await?;
                 }
             }
             Ok(())
         }
 
-        fn write_numeric_limit(
+        async fn write_numeric_limit(
             child_cgroup: &ChildCGroup,
             file: &str,
             limit: u64,
         ) -> anyhow::Result<usize> {
-            Self::write_limit(child_cgroup, file, format!("{}\n", limit))
+            Self::write_limit(child_cgroup, file, format!("{}\n", limit)).await
         }
 
-        fn write_limit<S: AsRef<str>>(
+        async fn write_limit<S: AsRef<str>>(
             child_cgroup: &ChildCGroup,
             file: &str,
             content: S,
@@ -240,6 +244,7 @@ pub mod runtime {
             let mut file = OpenOptions::new()
                 .write(true)
                 .open(&path)
+                .await
                 .with_context(|| format!("Cannot open {:?} for writing", path))
                 .map_err(|err| {
                     error!("{}", err);
@@ -247,6 +252,7 @@ pub mod runtime {
                 })?;
             let content = content.as_ref();
             file.write(content.as_bytes())
+                .await
                 .map_err(|err| {
                     error!(
                         "Error writing content {} to file {:?} - {}",

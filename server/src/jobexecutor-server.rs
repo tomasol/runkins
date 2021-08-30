@@ -99,6 +99,7 @@ impl JobExecutor for MyJobExecutor {
                     cgroup_config,
                     limits,
                 )
+                .await
             } else {
                 return Err(tonic::Status::invalid_argument(
                     "cgroup support is not enabled",

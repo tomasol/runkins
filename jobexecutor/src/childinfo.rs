@@ -318,7 +318,7 @@ where
         Self::new_internal(pid, command, chunk_to_output, &process_path, None)
     }
 
-    pub fn new_with_cgroup<F, STR, ITER>(
+    pub async fn new_with_cgroup<F, STR, ITER>(
         pid: Pid,
         process_path: STR,
         process_args: ITER,
@@ -338,7 +338,7 @@ where
             &process_path,
             process_args,
             limits,
-        )
+        ).await
         .map_err(ChildInfoError::ProcessExecutionError)?;
         Self::new_internal(
             pid,

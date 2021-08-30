@@ -8,6 +8,6 @@ anyhow = "1.0.42"
 log = "0.4"
 rand = "0.8"
 thiserror = "1.0"
-tokio = {version = "1.0", features = ["rt-multi-thread", "macros", "sync", "process", "io-util"]}
+tokio = {version = "1.0", features = ["rt-multi-thread", "macros", "sync", "process", "io-util", "fs"]}
 tokio-stream = {version = "0.1", features = ["net"]}
 tonic = {version = "0.5", optional = true}
