@@ -36,6 +36,7 @@ fn attach_process_to_cgroup(pid: u32, cgroup_string: &str) -> Result<()> {
     cgroup_procs
         .write(format!("{}\n", pid).as_bytes())
         .with_context(|| format!("Cannot write {:?}", cgroup_procs_path))?;
+    cgroup_procs.flush()?;
     Ok(())
 }
 

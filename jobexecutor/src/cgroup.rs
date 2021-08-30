@@ -1,8 +1,6 @@
 use log::*;
 use std::{ffi::OsStr, path::PathBuf};
 use thiserror::Error;
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::childinfo::Pid;
@@ -98,11 +96,13 @@ pub mod server_config {
 }
 
 pub mod runtime {
+
     use super::{
         server_config::{CGroupConfig, ChildCGroup},
         *,
     };
     use anyhow::Context;
+    use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 
     #[derive(Error, Debug)]
     pub enum CGroupCommandError {
@@ -140,10 +140,29 @@ pub mod runtime {
                 limits,
                 child_cgroup
             );
-            limits
-                .write(&child_cgroup, cgroup_config)
-                .await
-                .map_err(CGroupCommandError::WritingCGroupConfigurationFailed)?;
+            let config_result = limits.write(&child_cgroup, cgroup_config).await;
+            // if limit writing fails, clean up the child_cgroup
+            match config_result {
+                Ok(ok) => Ok(ok),
+                Err(write_err) => {
+                    // remove the cgroup, otherwise it will stay there forever
+                    debug!("[{}] Cleaning up cgroup after failed configuration", pid);
+                    child_cgroup
+                        .clean_up()
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to remove cgroup, as a result of failed, as a result of failed write - {}",
+                                &write_err
+                            )
+                        })
+                        .map_err(CGroupCommandError::WritingCGroupConfigurationFailed)?;
+                    Err(CGroupCommandError::WritingCGroupConfigurationFailed(
+                        write_err,
+                    ))
+                }
+            }?;
+
             let mut command = Command::new(cgroup_config.cgexec_rs());
             // first argument is the cgroup name
             let mut new_args = Vec::with_capacity(args.len() + 2);
@@ -231,7 +250,7 @@ pub mod runtime {
             child_cgroup: &ChildCGroup,
             file: &str,
             limit: u64,
-        ) -> anyhow::Result<usize> {
+        ) -> anyhow::Result<()> {
             Self::write_limit(child_cgroup, file, format!("{}\n", limit)).await
         }
 
@@ -239,7 +258,7 @@ pub mod runtime {
             child_cgroup: &ChildCGroup,
             file: &str,
             content: S,
-        ) -> anyhow::Result<usize> {
+        ) -> anyhow::Result<()> {
             let path = child_cgroup.as_path().join(file);
             let mut file = OpenOptions::new()
                 .write(true)
@@ -247,19 +266,26 @@ pub mod runtime {
                 .await
                 .with_context(|| format!("Cannot open {:?} for writing", path))
                 .map_err(|err| {
+                    // log the error
                     error!("{}", err);
                     err
                 })?;
             let content = content.as_ref();
-            file.write(content.as_bytes())
-                .await
+            let mut write_result = file.write_all(content.as_bytes()).await;
+
+            if write_result.is_ok() {
+                write_result = file.flush().await;
+            }
+            write_result
                 .map_err(|err| {
+                    // log the error + invalid content
                     error!(
-                        "Error writing content {} to file {:?} - {}",
+                        "Error writing content \"{}\" to file {:?} - {}",
                         content, path, err
                     );
                     err
                 })
+                // do not store content in the error
                 .with_context(|| format!("Cannot write to file {:?}", path))
         }
     }
