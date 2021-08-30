@@ -69,6 +69,35 @@ impl MyJobExecutor {
         }
         limits
     }
+
+    async fn create_child_info(
+        &self,
+        pid: Pid,
+        path: String,
+        args: Vec<String>,
+        limits: Option<CGroupLimits>,
+    ) -> Result<ChildInfo<Result<OutputResponse, tonic::Status>>, tonic::Status> {
+        Ok(match (limits, &self.cgroup_config) {
+            (Some(limits), Some(cgroup_config)) => {
+                ChildInfo::new_with_cgroup(
+                    pid,
+                    path,
+                    args.into_iter(),
+                    Self::chunk_to_output,
+                    cgroup_config,
+                    limits,
+                )
+                .await?
+            }
+            (None, _) => ChildInfo::new(pid, path, args.into_iter(), Self::chunk_to_output)?,
+            _ => {
+                // client requested limits but cgroup_config is not available
+                return Err(tonic::Status::invalid_argument(
+                    "cgroup support is not enabled",
+                ));
+            }
+        })
+    }
 }
 
 #[tonic::async_trait]
@@ -89,30 +118,14 @@ impl JobExecutor for MyJobExecutor {
             }
         };
         debug!("Assigned pid {} to the child process", pid);
-        let child_info = if let Some(limits) = start_req.cgroup.map(Self::construct_limits) {
-            if let Some(cgroup_config) = &self.cgroup_config {
-                ChildInfo::new_with_cgroup(
-                    pid,
-                    start_req.path,
-                    start_req.args.into_iter(),
-                    Self::chunk_to_output,
-                    cgroup_config,
-                    limits,
-                )
-                .await
-            } else {
-                return Err(tonic::Status::invalid_argument(
-                    "cgroup support is not enabled",
-                ));
-            }
-        } else {
-            ChildInfo::new(
+        let child_info = self
+            .create_child_info(
                 pid,
                 start_req.path,
-                start_req.args.into_iter(),
-                Self::chunk_to_output,
+                start_req.args,
+                start_req.cgroup.map(Self::construct_limits),
             )
-        }?;
+            .await?;
         store.insert(pid, child_info);
 
         Ok(Response::new(StartResponse {
