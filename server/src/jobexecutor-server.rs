@@ -34,13 +34,13 @@ impl MyJobExecutor {
 
     fn chunk_to_output(chunk: Chunk) -> Result<OutputResponse, tonic::Status> {
         Ok(match chunk {
-            Chunk::StdOut(str) => OutputResponse {
-                std_out_chunk: Some(OutputChunk { chunk: str }),
+            Chunk::StdOut(chunk) => OutputResponse {
+                std_out_chunk: Some(OutputChunk { chunk }),
                 std_err_chunk: None,
             },
-            Chunk::StdErr(str) => OutputResponse {
+            Chunk::StdErr(chunk) => OutputResponse {
                 std_out_chunk: None,
-                std_err_chunk: Some(OutputChunk { chunk: str }),
+                std_err_chunk: Some(OutputChunk { chunk }),
             },
         })
     }
@@ -208,7 +208,7 @@ impl JobExecutor for MyJobExecutor {
             .ok_or_else(|| tonic::Status::not_found("Cannot find job"))?;
 
         let (tx, rx) = mpsc::unbounded_channel();
-        child_info.add_client(tx)?;
+        child_info.add_client(tx).await?;
 
         Ok(Response::new(UnboundedReceiverStream::new(rx)))
     }

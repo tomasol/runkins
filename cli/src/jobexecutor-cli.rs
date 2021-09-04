@@ -176,10 +176,10 @@ async fn send_request(
             let mut stderr = stderr.lock();
             while let Some(chunk) = stream.message().await? {
                 if let Some(output_chunk) = chunk.std_out_chunk {
-                    stdout.write_all(output_chunk.chunk.as_bytes())?;
+                    stdout.write_all(&output_chunk.chunk[..])?;
                 }
                 if let Some(output_chunk) = chunk.std_err_chunk {
-                    stderr.write_all(output_chunk.chunk.as_bytes())?;
+                    stderr.write_all(&output_chunk.chunk[..])?;
                 }
             }
         }

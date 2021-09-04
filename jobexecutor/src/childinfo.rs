@@ -4,16 +4,14 @@ use std::ffi::OsStr;
 use std::process::ExitStatus;
 use std::process::Stdio;
 use thiserror::Error;
-use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncRead;
-use tokio::io::BufReader;
+use tokio::io::AsyncReadExt;
 use tokio::process::Child;
 use tokio::process::Command;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
-use tokio::sync::oneshot::Sender;
 
 use crate::cgroup::runtime::CGroupCommandError;
 use crate::cgroup::runtime::CGroupCommandFactory;
@@ -44,32 +42,32 @@ pub type Pid = u64;
 
 #[derive(Debug)]
 enum ActorEvent<OUTPUT> {
-    ChunkAdded(Chunk),                            // sent by std_forwarder
-    ClientAdded(ClientTx<OUTPUT>),                // send by API call
-    ProcessFinished(std::io::Result<ExitStatus>), // internal to main_actor
-    StatusRequest(Sender<RunningState>),          // send by API call
-    KillRequest(Sender<std::io::Result<()>>),     // send by API call
-    StreamFinished(StdStream),                    // Sent by std_forwarder tasks
+    ChunkAdded(Chunk),                                 // sent by std_forwarder
+    ClientAdded(ClientTx<OUTPUT>),                     // send by API call
+    ProcessFinished(std::io::Result<ExitStatus>),      // internal to main_actor
+    StatusRequest(oneshot::Sender<RunningState>),      // send by API call
+    KillRequest(oneshot::Sender<std::io::Result<()>>), // send by API call
+    StreamFinished(StdStream),                         // Sent by std_forwarder tasks
 }
 
 #[derive(Debug)]
 pub struct ChildInfo<OUTPUT> {
     pid: Pid,
-    actor_tx: UnboundedSender<ActorEvent<OUTPUT>>,
+    actor_tx: mpsc::Sender<ActorEvent<OUTPUT>>,
     child_cgroup: Option<ChildCGroup>,
 }
 
 #[derive(Debug, Clone)]
 pub enum Chunk {
-    StdOut(String),
-    StdErr(String),
+    StdOut(Vec<u8>),
+    StdErr(Vec<u8>),
 }
 
 impl Chunk {
-    fn new(std_stream: &StdStream, string: String) -> Chunk {
+    fn new(std_stream: &StdStream, content: Vec<u8>) -> Chunk {
         match std_stream {
-            StdStream::StdOut => Chunk::StdOut(string),
-            StdStream::StdErr => Chunk::StdErr(string),
+            StdStream::StdOut => Chunk::StdOut(content),
+            StdStream::StdErr => Chunk::StdErr(content),
         }
     }
 }
@@ -87,6 +85,9 @@ pub enum StdStream {
     StdErr,
 }
 
+// buffer capacity set arbitrarily
+const CHUNK_BUF_CAPACITY: usize = 1024;
+
 /// ChildInfo represents the started process, its state, output and all associated data.
 /// It starts several async tasks to keep track of the output and running status.
 /// Note about generic types:
@@ -96,9 +97,10 @@ impl<OUTPUT> ChildInfo<OUTPUT>
 where
     OUTPUT: std::fmt::Debug + Send + 'static,
 {
-    pub fn add_client(&self, client_tx: ClientTx<OUTPUT>) -> Result<(), ChildInfoError> {
+    pub async fn add_client(&self, client_tx: ClientTx<OUTPUT>) -> Result<(), ChildInfoError> {
         self.actor_tx
             .send(ActorEvent::ClientAdded(client_tx))
+            .await
             .map_err(|err| {
                 error!("[{}] Cannot add_client: {}", self.pid, err);
                 ChildInfoError::MainActorFinished("Cannot add client".to_string())
@@ -109,27 +111,28 @@ where
     // to the provided event sender of main_actor.
     async fn std_forwarder<T: AsyncRead + std::marker::Unpin>(
         pid: Pid,
-        tx: UnboundedSender<ActorEvent<OUTPUT>>,
-        mut buf_reader: BufReader<T>,
+        tx: mpsc::Sender<ActorEvent<OUTPUT>>,
+        mut reader: T,
         std_stream: StdStream,
     ) {
         debug!("[{}] std_forwarder({:?}) started", pid, std_stream);
         loop {
-            let mut line = String::new();
-            // sending larger chunks than one line might increase performance
-            match buf_reader.read_line(&mut line).await {
+            let mut buffer = Vec::with_capacity(CHUNK_BUF_CAPACITY);
+            match reader.read_buf(&mut buffer).await {
                 Ok(0) => {
                     debug!("[{}] std_forwarder({:?}) is done reading", pid, std_stream);
                     break;
                 }
                 Ok(_) => {
                     // send the line to the actor
-                    debug!(
-                        "[{}] std_forwarder({:?}) got line - {}",
-                        pid, std_stream, line
+                    trace!(
+                        "[{}] std_forwarder({:?}) read_buf result {:?}",
+                        pid,
+                        std_stream,
+                        buffer
                     );
-                    let message = ActorEvent::ChunkAdded(Chunk::new(&std_stream, line));
-                    let send_result = tx.send(message);
+                    let message = ActorEvent::ChunkAdded(Chunk::new(&std_stream, buffer));
+                    let send_result = tx.send(message).await;
                     if let Err(err) = send_result {
                         // rx closed or dropped, so the main actor died
                         info!(
@@ -141,25 +144,21 @@ where
                 }
                 Err(err) => {
                     error!(
-                        "[{}] std_forwarder({:?}) is terminating - Error in read_line: {}",
+                        "[{}] std_forwarder({:?}) is terminating - {}",
                         pid, std_stream, err
                     );
-                    // IO error or invalid UTF-8, consider recovery. For now just finish reading.
                     break;
                 }
             }
         }
-        if let Err(err) = tx.send(ActorEvent::StreamFinished(std_stream)) {
-            warn!(
-                "[{}] std_forwarder was unable to send StreamFinished - {}",
-                pid, err
-            );
+        if let Err(_) = tx.send(ActorEvent::StreamFinished(std_stream)).await {
+            warn!("[{}] std_forwarder was unable to send StreamFinished", pid);
         }
     }
 
     async fn main_actor<F: Fn(Chunk) -> OUTPUT>(
         pid: Pid,
-        mut rx: UnboundedReceiver<ActorEvent<OUTPUT>>,
+        mut rx: Receiver<ActorEvent<OUTPUT>>,
         mut child: Child,
         chunk_to_output: F,
     ) {
@@ -214,7 +213,7 @@ where
                         );
                     // notify all clients, removing disconnected
                     clients.retain(|client_tx| {
-                        ChildInfo::send_line(pid, client_tx, chunk.clone(), &chunk_to_output)
+                        ChildInfo::send_chunk(pid, client_tx, chunk.clone(), &chunk_to_output)
                             .map_err(|_| {
                                 info!("[{}] main_actor removing client {:?}", pid, client_tx);
                             })
@@ -275,19 +274,19 @@ where
         chunk_to_output: &F,
     ) -> Result<(), ()> {
         for chunk in chunks {
-            ChildInfo::send_line(pid, client_tx, chunk.clone(), chunk_to_output)?;
+            ChildInfo::send_chunk(pid, client_tx, chunk.clone(), chunk_to_output)?;
         }
         Ok(())
     }
 
-    fn send_line<F: Fn(Chunk) -> OUTPUT>(
+    fn send_chunk<F: Fn(Chunk) -> OUTPUT>(
         pid: Pid,
         client_tx: &ClientTx<OUTPUT>,
         chunk: Chunk,
         chunk_to_output: &F,
     ) -> Result<(), ()> {
         trace!(
-            "[{}] send_line chunk:{:?} client:{:?}",
+            "[{}] send_chunk chunk:{:?} client:{:?}",
             pid,
             chunk,
             client_tx
@@ -338,7 +337,8 @@ where
             &process_path,
             process_args,
             limits,
-        ).await
+        )
+        .await
         .map_err(ChildInfoError::ProcessExecutionError)?;
         Self::new_internal(
             pid,
@@ -377,7 +377,7 @@ where
             .take()
             .ok_or(ChildInfoError::CannotCaptureStream(StdStream::StdErr))?;
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(1);
         // TODO benchmark against one giant select!
         tokio::spawn(async move {
             ChildInfo::main_actor(pid, rx, child, chunk_to_output).await;
@@ -385,13 +385,13 @@ where
         {
             let tx = tx.clone();
             tokio::spawn(async move {
-                ChildInfo::std_forwarder(pid, tx, BufReader::new(stdout), StdStream::StdOut).await;
+                ChildInfo::std_forwarder(pid, tx, stdout, StdStream::StdOut).await;
             });
         }
         {
             let tx = tx.clone();
             tokio::spawn(async move {
-                ChildInfo::std_forwarder(pid, tx, BufReader::new(stderr), StdStream::StdErr).await;
+                ChildInfo::std_forwarder(pid, tx, stderr, StdStream::StdErr).await;
             });
         }
         Ok(ChildInfo {
@@ -405,6 +405,7 @@ where
         let (status_tx, status_rx) = oneshot::channel();
         self.actor_tx
             .send(ActorEvent::StatusRequest(status_tx))
+            .await
             .map_err(|err| {
                 error!(
                     "[{}] Cannot send StatusRequest to the main actor - {}",
@@ -423,6 +424,7 @@ where
         let (kill_tx, kill_rx) = oneshot::channel();
         self.actor_tx
             .send(ActorEvent::KillRequest(kill_tx))
+            .await
             .map_err(|_| {
                 error!("[{}] Unable to send kill message", self.pid);
                 ChildInfoError::MainActorFinished("Unable to send kill message".to_string())

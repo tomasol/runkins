@@ -37,8 +37,8 @@ This will start the gRPC server on (currently hardcoded)
 
 To see the error logs in the console, use
 ```sh
-RUST_LOG=jobexecutor_server=trace,jobexecutor=trace \
- cargo run --bin jobexecutor-server
+export RUST_LOG=jobexecutor_server=debug,jobexecutor=debug,info
+cargo run --bin jobexecutor-server
  ```
 
 ### CLI

@@ -94,7 +94,7 @@ message OutputRequest {
 }
 
 message OutputChunk {
-    string chunk = 1;
+    bytes chunk = 1;
 }
 
 message OutputResponse {
