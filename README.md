@@ -7,6 +7,7 @@ Folder structure:
 * proto - `*.proto` definition
 * server - binary `jobexecutor-server` - gRPC server
 * testing - binary `slow` for testing
+* systemd - sample .service file
 
 ## Building
 ### Requirements
@@ -86,6 +87,9 @@ Following environment variables need to be set, otherwise cgroup support will no
 * PARENT_CGROUP - full path to a cgroup directory that can be written by the current user
 * CGROUP_BLOCK_DEVICE_ID - in form of MAJOR:MINOR, see `lsblk`
 * CGEXEC_RS - path to cgexec-rs binary, might be omitted if it lives in the same folder as `jobexecutor-server`
+* CGROUP_MOVE_CURRENT_PID_TO_SUBFOLDER_ENABLED - required for systemd service support. If set (to anything), creates PARENT_CGROUP/service cgroup if needed and moves current pid there. This setting also adds the required controllres to $PARENT_CGROUP/cgroup.subtree_control .
+
+### Starting new user slice using systemd-run
 
 If the parent cgroup is created using `systemd-run`, make sure the shell is still open. Example:
 ```sh
@@ -94,6 +98,15 @@ $ systemd-run --user -p Delegate=yes --slice=my.slice --shell
 # export PARENT_CGROUP=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/my.slice
 ```
 
+### Managing the slice and service using systemd .service file
+Create file `jobexecutor.service` based on `systemd/jobexecutor-sample.service` and
+move/link it to `/etc/systemd/system/` folder. Then start the service:
+```sh
+systemctl daemon-reload
+systemctl start jobexecutor
+```
+
+### Verification
 Verify that the process runs in its own cgroup:
 ```sh
 # note the --limits flag - if not set, cgroup will not be created

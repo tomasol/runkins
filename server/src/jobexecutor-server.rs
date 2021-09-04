@@ -257,7 +257,7 @@ impl JobExecutor for MyJobExecutor {
     }
 }
 
-fn guess_cgroup_config() -> Option<Result<CGroupConfig, CGroupConfigError>> {
+async fn guess_cgroup_config() -> Option<Result<CGroupConfig, CGroupConfigError>> {
     let cgexec_rs = if let Ok(path) = std::env::var("CGEXEC_RS") {
         path.into()
     } else {
@@ -266,6 +266,8 @@ fn guess_cgroup_config() -> Option<Result<CGroupConfig, CGroupConfigError>> {
         exe.parent()?.join("cgexec-rs")
     };
     trace!("Using cgexec-rs {:?}", cgexec_rs);
+    // when running as systemd service, this could be guessed using
+    // cgroup2 mount point + /proc/self/cgroup
     let parent_cgroup = std::env::var("PARENT_CGROUP")
         .map_err(|_| debug!("PARENT_CGROUP not set"))
         .ok()?
@@ -277,17 +279,23 @@ fn guess_cgroup_config() -> Option<Result<CGroupConfig, CGroupConfigError>> {
         .ok()?;
     trace!("Using block device {:?}", cgroup_block_device_id);
 
-    Some(CGroupConfig::new(CGroupConfigBuilder {
-        cgexec_rs,
-        parent_cgroup,
-        cgroup_block_device_id,
-    }))
+    let move_current_pid_to_subfolder =
+        std::env::var("CGROUP_MOVE_CURRENT_PID_TO_SUBFOLDER_ENABLED").is_ok();
+    Some(
+        CGroupConfig::new(CGroupConfigBuilder {
+            cgexec_rs,
+            parent_cgroup,
+            cgroup_block_device_id,
+            move_current_pid_to_subfolder,
+        })
+        .await,
+    )
 }
 
 async fn run_server() -> anyhow::Result<()> {
     // TODO low: make this configurable
     let addr = "[::1]:50051".parse()?;
-    let cgroup_config = match guess_cgroup_config() {
+    let cgroup_config = match guess_cgroup_config().await {
         Some(Ok(cgroup_config)) => {
             info!("cgroup support enabled: {:?}", cgroup_config);
             Some(cgroup_config)

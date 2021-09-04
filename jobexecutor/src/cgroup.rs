@@ -10,12 +10,23 @@ pub mod server_config {
 
     use super::*;
 
+    /// Subfolder name for std::process::id() moving, see [CGroupConfig::move_current_process_to_subgroup]
+    const SERVICE_SUBFOLDER_NAME: &str = "service";
+    /// File name controlling which processes belong to a cgroup
+    const CGROUP_PROCS: &str = "cgroup.procs";
+    const CGROUP_SUBTREE_CONTROL: &str = "cgroup.subtree_control";
+    const CGROUP_SUBTREE_CONTROL_ENABLE_CONTROLLERS: &str = "+cpu +memory +io";
+
     #[derive(Error, Debug)]
     pub enum CGroupConfigError {
         #[error("parent_cgroup must be an absolute path to a directory")]
         WrongParentCGroup,
         #[error("cgexec_rs must be an absolute path to a file")]
         WrongCGExecRs,
+        #[error("file is in the way of service cgroup - {0}")]
+        WrongServiceCGroup(PathBuf),
+        #[error("cannot create service cgroup - {0}")]
+        CannotCreateServiceCGroup(#[from] anyhow::Error),
     }
 
     #[derive(Debug)]
@@ -23,6 +34,7 @@ pub mod server_config {
         pub parent_cgroup: PathBuf,
         pub cgexec_rs: PathBuf,
         pub cgroup_block_device_id: String,
+        pub move_current_pid_to_subfolder: bool,
     }
 
     #[derive(Debug, Clone)]
@@ -32,8 +44,12 @@ pub mod server_config {
         cgroup_block_device_id: String,
     }
 
+    /// Global cgroup configuration.
+    /// All new processes (that require cgroup limits) will live in subgroups of the parent_cgroup.
+    /// Processes that use io.max will be limited only on one device stored in cgroup_block_device_id.
     impl CGroupConfig {
-        pub fn new(builder: CGroupConfigBuilder) -> Result<CGroupConfig, CGroupConfigError> {
+        pub async fn new(builder: CGroupConfigBuilder) -> Result<CGroupConfig, CGroupConfigError> {
+            debug!("Configuring cgroup support: {:?}", builder);
             let parent_cgroup = builder.parent_cgroup;
             let cgexec_rs = builder.cgexec_rs;
             if !parent_cgroup.is_absolute() || !parent_cgroup.is_dir() {
@@ -41,11 +57,15 @@ pub mod server_config {
             } else if !cgexec_rs.is_absolute() || !cgexec_rs.is_file() {
                 Err(CGroupConfigError::WrongCGExecRs)
             } else {
-                Ok(CGroupConfig {
+                let cgroup_config = CGroupConfig {
                     parent_cgroup,
                     cgexec_rs,
                     cgroup_block_device_id: builder.cgroup_block_device_id,
-                })
+                };
+                if builder.move_current_pid_to_subfolder {
+                    cgroup_config.move_current_process_to_subgroup().await?;
+                }
+                Ok(cgroup_config)
             }
         }
 
@@ -65,6 +85,50 @@ pub mod server_config {
                 err
             })?;
             Ok(ChildCGroup { path })
+        }
+
+        /// When running as systemd service in a slice, create new subdirectory in
+        /// the 'service' folder and move current process there.
+        /// This is needed to follow the 'leaf rule' of cgroup v2.
+        /// E.g. if the service lived in /sys/fs/cgroup/jobexecutor.slice/jobexecutor.service,
+        /// it must be set as PARENT_CGROUP.
+        /// Create 'service' subfolder if not present and move itself there.
+        /// Add required controllers to PARENT_CGROUP/cgroup.subtree_control.
+        /// Executed processes will inherit them as PARENT_CGROUP/$EID/cgroup.controllers.
+        /// Adding limits to the server process is not required.
+        async fn move_current_process_to_subgroup(&self) -> Result<(), CGroupConfigError> {
+            let path = self.parent_cgroup.join(SERVICE_SUBFOLDER_NAME);
+            if path.exists() && !path.is_dir() {
+                return Err(CGroupConfigError::WrongServiceCGroup(path));
+            }
+
+            if !path.exists() {
+                trace!("Creating service cgroup {:?}", path);
+                tokio::fs::create_dir(path.clone())
+                    .await
+                    .map_err(|err| {
+                        error!("Cannot create service cgroup {:?} - {}", path, err);
+                        anyhow::anyhow!(format!("cannot create service cgroup - {}", err))
+                    })
+                    .map_err(CGroupConfigError::CannotCreateServiceCGroup)?;
+            }
+            // move current process to 'service' subgroup by writing to its 'cgroup.procs'
+            let content = std::process::id().to_string();
+            crate::cgroup::runtime::CGroupLimits::write_value_to_file(
+                path.join(CGROUP_PROCS),
+                content,
+            )
+            .await
+            .map_err(CGroupConfigError::CannotCreateServiceCGroup)?;
+
+            // Make sure all needed controllers are in 'cgroup.subtree_control'
+            // so that new cgroups can be limited.
+            crate::cgroup::runtime::CGroupLimits::write_value_to_file(
+                self.parent_cgroup.join(CGROUP_SUBTREE_CONTROL),
+                CGROUP_SUBTREE_CONTROL_ENABLE_CONTROLLERS,
+            )
+            .await
+            .map_err(CGroupConfigError::CannotCreateServiceCGroup)
         }
     }
 
@@ -86,7 +150,9 @@ pub mod server_config {
 
         pub async fn clean_up(&self) -> std::io::Result<()> {
             debug!("Deleting {:?}", &self.path);
-            // TODO low: this will fail if the child process forked
+            // TODO: this will fail if the child process forked
+            // For production, forking/cloning might not be an issue
+            // or killing of all processes in cgroup.procs might be needed.
             tokio::fs::remove_dir(&self.path).await.map_err(|err| {
                 error!("Cannot remove cgroup {:?} - {}", &self.path, err);
                 err
@@ -96,6 +162,8 @@ pub mod server_config {
 }
 
 pub mod runtime {
+
+    use std::path::Path;
 
     use super::{
         server_config::{CGroupConfig, ChildCGroup},
@@ -206,6 +274,10 @@ pub mod runtime {
             child_cgroup: &ChildCGroup,
             cgroup_config: &CGroupConfig,
         ) -> anyhow::Result<()> {
+            // consider disabling forking by setting pids.max=1, or bigger value to prevent fork bombs.
+            // However this setting limits TIDs not PIDs.
+            // Self::write_numeric_limit(child_cgroup, "pids.max", 1).await?;
+            // Forking is currently not handled.
             if let Some(memory_max) = self.memory_max {
                 Self::write_numeric_limit(child_cgroup, "memory.max", memory_max).await?;
             }
@@ -248,18 +320,26 @@ pub mod runtime {
 
         async fn write_numeric_limit(
             child_cgroup: &ChildCGroup,
-            file: &str,
+            file_name: &str,
             limit: u64,
         ) -> anyhow::Result<()> {
-            Self::write_limit(child_cgroup, file, format!("{}\n", limit)).await
+            Self::write_limit(child_cgroup, file_name, format!("{}\n", limit)).await
         }
 
         async fn write_limit<S: AsRef<str>>(
             child_cgroup: &ChildCGroup,
-            file: &str,
+            file_name: &str,
             content: S,
         ) -> anyhow::Result<()> {
-            let path = child_cgroup.as_path().join(file);
+            let path = child_cgroup.as_path().join(file_name);
+            Self::write_value_to_file(path, content).await
+        }
+
+        pub(crate) async fn write_value_to_file<S: AsRef<str>>(
+            path: impl AsRef<Path>,
+            content: S,
+        ) -> anyhow::Result<()> {
+            let path = path.as_ref();
             let mut file = OpenOptions::new()
                 .write(true)
                 .open(&path)
