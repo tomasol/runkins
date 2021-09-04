@@ -151,7 +151,11 @@ where
                 }
             }
         }
-        if let Err(_) = tx.send(ActorEvent::StreamFinished(std_stream)).await {
+        if tx
+            .send(ActorEvent::StreamFinished(std_stream))
+            .await
+            .is_err()
+        {
             warn!("[{}] std_forwarder was unable to send StreamFinished", pid);
         }
     }
