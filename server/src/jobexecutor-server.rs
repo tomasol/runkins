@@ -200,7 +200,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // TODO low: make this configurable
     let addr = "[::1]:50051".parse()?;
     let exec = MyJobExecutor::default();
-
+    info!("Starting gRPC server at {}", addr);
     Server::builder()
         .add_service(JobExecutorServer::new(exec))
         .serve(addr)

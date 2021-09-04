@@ -96,7 +96,6 @@ async fn exec_cli(opt: Subcommand) -> Result<(), Box<dyn std::error::Error>> {
             debug!("Request=${:?}", request);
             let response = client.stop(request).await?;
             info!("Response={:?}", response);
-            println!("ok");
         }
         Subcommand::Output { pid } => {
             let request = tonic::Request::new(OutputRequest {
@@ -126,7 +125,6 @@ async fn exec_cli(opt: Subcommand) -> Result<(), Box<dyn std::error::Error>> {
             debug!("Request=${:?}", request);
             let response = client.remove(request).await?;
             info!("Response={:?}", response);
-            println!("ok");
         }
     };
     Ok(())
