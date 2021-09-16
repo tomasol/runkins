@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
+use tokio::sync::oneshot::error::RecvError;
 
 use crate::cgroup::runtime::CGroupCommandError;
 use crate::cgroup::runtime::CGroupCommandFactory;
@@ -20,19 +21,43 @@ use crate::cgroup::server_config::CGroupConfig;
 use crate::cgroup::server_config::ChildCGroup;
 
 #[derive(Error, Debug)]
-pub enum ChildInfoError {
-    #[error("main_actor is no longer running - {0}")]
-    MainActorFinished(String),
+pub enum StopError {
+    #[error("cannot stop the child process")]
+    CannotStopProcess(#[source] std::io::Error),
+    #[error("main_actor is no longer running")] // TODO: panic instead?
+    MainActorFinished,
+    #[error("main_actor failed to send the response")] // TODO: panic instead?
+    FailedToReceiveResponse(#[source] RecvError),
+}
+
+#[derive(Error, Debug)]
+pub enum AddClientError {
+    #[error("main_actor is no longer running")] // TODO: panic instead?
+    MainActorFinished,
+}
+
+#[derive(Error, Debug)]
+pub enum StatusError {
     #[error("cannot get the child process status")]
     UnknownProcessStatus,
-    #[error("cannot stop the child process - {0}")]
-    CannotStopProcess(#[from] std::io::Error),
+    #[error("main_actor is no longer running")] // TODO: panic instead?
+    MainActorFinished,
+}
+
+#[derive(Error, Debug)]
+pub enum ChildInfoCreationError {
     #[error("cannot capture {0:?} of the child process")]
     CannotCaptureStream(StdStream),
-    #[error("cannot run process - {0}")]
-    CannotRunProcess(#[from] anyhow::Error),
-    #[error("cannot run process in cgroup - {0}")]
-    ProcessExecutionError(#[from] CGroupCommandError),
+    #[error("cannot run process")]
+    CannotRunProcess(#[source] anyhow::Error),
+}
+
+#[derive(Error, Debug)]
+pub enum ChildInfoCreationWithCGroupError {
+    #[error("error while child process creation")]
+    ChildInfoCreationError(#[source] ChildInfoCreationError),
+    #[error("cannot run process in cgroup")]
+    ProcessExecutionError(#[source] CGroupCommandError),
 }
 
 /// Type of the writable part of a mpsc channel for streaming output chunks to a client.
@@ -97,13 +122,13 @@ impl<OUTPUT> ChildInfo<OUTPUT>
 where
     OUTPUT: std::fmt::Debug + Send + 'static,
 {
-    pub async fn add_client(&self, client_tx: ClientTx<OUTPUT>) -> Result<(), ChildInfoError> {
+    pub async fn add_client(&self, client_tx: ClientTx<OUTPUT>) -> Result<(), AddClientError> {
         self.actor_tx
             .send(ActorEvent::ClientAdded(client_tx))
             .await
             .map_err(|err| {
                 error!("[{}] Cannot add_client: {}", self.pid, err);
-                ChildInfoError::MainActorFinished("Cannot add client".to_string())
+                AddClientError::MainActorFinished
             })
     }
 
@@ -305,15 +330,14 @@ where
         Ok(())
     }
 
-    pub fn new<F, STR, ITER>(
+    pub fn new<STR, ITER>(
         pid: Pid,
         process_path: STR,
         process_args: ITER,
-        chunk_to_output: F,
-    ) -> Result<Self, ChildInfoError>
+        chunk_to_output: fn(Chunk) -> OUTPUT,
+    ) -> Result<Self, ChildInfoCreationError>
     where
-        F: Fn(Chunk) -> OUTPUT + Send + 'static,
-        ITER: ExactSizeIterator<Item = STR>,
+        ITER: IntoIterator<Item = STR>,
         STR: AsRef<OsStr>,
     {
         let mut command = Command::new(&process_path);
@@ -321,16 +345,15 @@ where
         Self::new_internal(pid, command, chunk_to_output, &process_path, None)
     }
 
-    pub async fn new_with_cgroup<F, STR, ITER>(
+    pub async fn new_with_cgroup<STR, ITER>(
         pid: Pid,
         process_path: STR,
         process_args: ITER,
-        chunk_to_output: F,
+        chunk_to_output: fn(Chunk) -> OUTPUT,
         cgroup_config: &CGroupConfig,
         limits: CGroupLimits,
-    ) -> Result<Self, ChildInfoError>
+    ) -> Result<Self, ChildInfoCreationWithCGroupError>
     where
-        F: Fn(Chunk) -> OUTPUT + Send + 'static,
         ITER: ExactSizeIterator<Item = STR>,
         STR: AsRef<OsStr>,
     {
@@ -343,7 +366,7 @@ where
             limits,
         )
         .await
-        .map_err(ChildInfoError::ProcessExecutionError)?;
+        .map_err(ChildInfoCreationWithCGroupError::ProcessExecutionError)?;
         Self::new_internal(
             pid,
             command,
@@ -351,15 +374,16 @@ where
             &process_path.as_ref(),
             Some(child_cgroup),
         )
+        .map_err(ChildInfoCreationWithCGroupError::ChildInfoCreationError)
     }
 
-    fn new_internal<F: Fn(Chunk) -> OUTPUT + Send + 'static, STR: AsRef<OsStr>>(
+    fn new_internal<STR: AsRef<OsStr>>(
         pid: Pid,
         mut command: Command,
-        chunk_to_output: F,
+        chunk_to_output: fn(Chunk) -> OUTPUT,
         process_path: STR,
         child_cgroup: Option<ChildCGroup>,
-    ) -> Result<Self, ChildInfoError> {
+    ) -> Result<Self, ChildInfoCreationError> {
         // consider adding ability to control env.vars
         command
             .current_dir(".") // consider making this configurable
@@ -369,17 +393,21 @@ where
         let mut child = command
             .spawn()
             .with_context(|| format!("[{}] Cannot run process - {:?}", pid, process_path.as_ref()))
-            .map_err(ChildInfoError::CannotRunProcess)?;
+            .map_err(ChildInfoCreationError::CannotRunProcess)?;
 
         let stdout = child
             .stdout
             .take()
-            .ok_or(ChildInfoError::CannotCaptureStream(StdStream::StdOut))?;
+            .ok_or(ChildInfoCreationError::CannotCaptureStream(
+                StdStream::StdOut,
+            ))?;
 
         let stderr = child
             .stderr
             .take()
-            .ok_or(ChildInfoError::CannotCaptureStream(StdStream::StdErr))?;
+            .ok_or(ChildInfoCreationError::CannotCaptureStream(
+                StdStream::StdErr,
+            ))?;
 
         let (tx, rx) = mpsc::channel(1);
         // TODO benchmark against one giant select!
@@ -405,7 +433,7 @@ where
         })
     }
 
-    pub async fn status(&self) -> Result<Option<ExitStatus>, ChildInfoError> {
+    pub async fn status(&self) -> Result<Option<ExitStatus>, StatusError> {
         let (status_tx, status_rx) = oneshot::channel();
         self.actor_tx
             .send(ActorEvent::StatusRequest(status_tx))
@@ -415,30 +443,31 @@ where
                     "[{}] Cannot send StatusRequest to the main actor - {}",
                     self.pid, err
                 );
-                ChildInfoError::MainActorFinished("Error while getting the job status".to_string())
+                StatusError::MainActorFinished
             })?;
         match status_rx.await {
             Ok(RunningState::Running) => Ok(None),
             Ok(RunningState::Finished(exit_status)) => Ok(Some(exit_status)),
-            _ => Err(ChildInfoError::UnknownProcessStatus),
+            _ => Err(StatusError::UnknownProcessStatus),
         }
     }
 
-    pub async fn kill(&self) -> Result<(), ChildInfoError> {
+    pub async fn kill(&self) -> Result<(), StopError> {
         let (kill_tx, kill_rx) = oneshot::channel();
         self.actor_tx
             .send(ActorEvent::KillRequest(kill_tx))
             .await
             .map_err(|_| {
-                error!("[{}] Unable to send kill message", self.pid);
-                ChildInfoError::MainActorFinished("Unable to send kill message".to_string())
+                error!("[{}] StopError::MainActorFinished", self.pid);
+                StopError::MainActorFinished
             })?;
         match kill_rx.await {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(err)) => Err(ChildInfoError::CannotStopProcess(err)),
-            Err(_) => Err(ChildInfoError::MainActorFinished(
-                "Error while stopping the job".to_string(),
-            )),
+            Ok(Err(err)) => Err(StopError::CannotStopProcess(err)),
+            Err(err) => {
+                error!("[{}] StopError::FailedToReceiveResponse", self.pid);
+                Err(StopError::FailedToReceiveResponse(err))
+            }
         }
     }
 

@@ -1,11 +1,12 @@
-use childinfo::*;
 use job_executor::job_executor_server::*;
 use job_executor::*;
 use jobexecutor::cgroup::runtime::CGroupLimits;
 use jobexecutor::cgroup::server_config::CGroupConfig;
 use jobexecutor::cgroup::server_config::CGroupConfigBuilder;
 use jobexecutor::cgroup::server_config::CGroupConfigError;
-use jobexecutor::childinfo;
+use jobexecutor::childinfo::ChildInfo as ChildInfoGen;
+use jobexecutor::childinfo::Chunk;
+use jobexecutor::childinfo::Pid;
 use log::*;
 use rand::prelude::*;
 use std::collections::HashMap;
@@ -18,9 +19,11 @@ pub mod job_executor {
     tonic::include_proto!("jobexecutor");
 }
 
+type ChildInfo = ChildInfoGen<Result<OutputResponse, tonic::Status>>;
+
 #[derive(Debug)]
 pub struct MyJobExecutor {
-    child_storage: Mutex<HashMap<Pid, ChildInfo<Result<OutputResponse, tonic::Status>>>>,
+    child_storage: Mutex<HashMap<Pid, ChildInfo>>,
     cgroup_config: Option<CGroupConfig>,
 }
 
@@ -76,7 +79,7 @@ impl MyJobExecutor {
         path: String,
         args: Vec<String>,
         limits: Option<CGroupLimits>,
-    ) -> Result<ChildInfo<Result<OutputResponse, tonic::Status>>, tonic::Status> {
+    ) -> Result<ChildInfo, tonic::Status> {
         Ok(match (limits, &self.cgroup_config) {
             (Some(limits), Some(cgroup_config)) => {
                 ChildInfo::new_with_cgroup(
@@ -89,7 +92,7 @@ impl MyJobExecutor {
                 )
                 .await?
             }
-            (None, _) => ChildInfo::new(pid, path, args.into_iter(), Self::chunk_to_output)?,
+            (None, _) => ChildInfo::new(pid, path, args, Self::chunk_to_output)?,
             _ => {
                 // client requested limits but cgroup_config is not available
                 return Err(tonic::Status::invalid_argument(
@@ -325,4 +328,26 @@ async fn run_server() -> anyhow::Result<()> {
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
     run_server().await
+}
+
+#[cfg(test)]
+pub mod tests {
+    use jobexecutor::childinfo::ChildInfoCreationError;
+
+    use super::*;
+
+    #[test]
+    pub fn test_cannot_run_process() {
+        let chunk_to_output = |chunk: Chunk| -> String { format!("{:?}", chunk) };
+
+        match ChildInfoGen::new(1, "", [], chunk_to_output) {
+            Err(ChildInfoCreationError::CannotRunProcess(_)) => {}
+            Ok(_) => {
+                panic!("Unexpected Ok");
+            }
+            Err(e) => {
+                panic!("Unexpected error {:?}", e);
+            }
+        }
+    }
 }
