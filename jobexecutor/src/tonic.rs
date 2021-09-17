@@ -1,28 +1,19 @@
-use super::childinfo::*;
+macro_rules! from_err_to_tonic_status {
+    ($($err_name:ty),+) => {
+        $(
+        impl From<$err_name> for ::tonic::Status {
+            fn from(err: $err_name) -> Self {
+                ::tonic::Status::internal(err.to_string())
+            }
+        }
+        )+
+    };
+}
 
-// TODO use proc macro
-impl From<StopError> for tonic::Status {
-    fn from(err: StopError) -> Self {
-        tonic::Status::internal(err.to_string())
-    }
-}
-impl From<AddClientError> for tonic::Status {
-    fn from(err: AddClientError) -> Self {
-        tonic::Status::internal(err.to_string())
-    }
-}
-impl From<StatusError> for tonic::Status {
-    fn from(err: StatusError) -> Self {
-        tonic::Status::internal(err.to_string())
-    }
-}
-impl From<ChildInfoCreationError> for tonic::Status {
-    fn from(err: ChildInfoCreationError) -> Self {
-        tonic::Status::internal(err.to_string())
-    }
-}
-impl From<ChildInfoCreationWithCGroupError> for tonic::Status {
-    fn from(err: ChildInfoCreationWithCGroupError) -> Self {
-        tonic::Status::internal(err.to_string())
-    }
-}
+from_err_to_tonic_status!(
+    super::childinfo::StopError,
+    super::childinfo::AddClientError,
+    super::childinfo::StatusError,
+    super::childinfo::ChildInfoCreationError,
+    super::childinfo::ChildInfoCreationWithCGroupError
+);
