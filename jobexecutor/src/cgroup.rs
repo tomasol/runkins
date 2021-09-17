@@ -359,7 +359,7 @@ mod cgroup_writer {
             .await
             .map_err(|err| {
                 error!("Cannot open {:?} for writing - {}", path, err);
-                CGroupWriteError::CannotOpen(path.clone().to_path_buf(), err)
+                CGroupWriteError::CannotOpen(path.to_path_buf(), err)
             })?;
         let content = content.as_ref();
         let mut write_result = file.write_all(content.as_bytes()).await;
@@ -372,7 +372,7 @@ mod cgroup_writer {
                 "Error writing content \"{}\" to file {:?} - {}",
                 content, path, err
             );
-            CGroupWriteError::CannotWrite(path.clone().to_path_buf(), err)
+            CGroupWriteError::CannotWrite(path.to_path_buf(), err)
         })
     }
 }
