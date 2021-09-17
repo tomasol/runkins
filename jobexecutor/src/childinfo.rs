@@ -1,4 +1,3 @@
-use anyhow::Context;
 use log::*;
 use std::ffi::OsStr;
 use std::process::ExitStatus;
@@ -14,16 +13,16 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::RecvError;
 
+use crate::cgroup::concepts::CGroupLimits;
 use crate::cgroup::runtime::CGroupCommandError;
 use crate::cgroup::runtime::CGroupCommandFactory;
-use crate::cgroup::runtime::CGroupLimits;
 use crate::cgroup::server_config::CGroupConfig;
 use crate::cgroup::server_config::ChildCGroup;
 
 #[derive(Error, Debug)]
 pub enum StopError {
     #[error("cannot stop the child process")]
-    CannotStopProcess(#[source] std::io::Error),
+    CannotStopProcess(Pid, #[source] std::io::Error),
     #[error("main_actor is no longer running")] // TODO: panic instead?
     MainActorFinished,
     #[error("main_actor failed to send the response")] // TODO: panic instead?
@@ -39,7 +38,7 @@ pub enum AddClientError {
 #[derive(Error, Debug)]
 pub enum StatusError {
     #[error("cannot get the child process status")]
-    UnknownProcessStatus,
+    UnknownProcessStatus(Pid),
     #[error("main_actor is no longer running")] // TODO: panic instead?
     MainActorFinished,
 }
@@ -47,17 +46,17 @@ pub enum StatusError {
 #[derive(Error, Debug)]
 pub enum ChildInfoCreationError {
     #[error("cannot capture {0:?} of the child process")]
-    CannotCaptureStream(StdStream),
+    CannotCaptureStream(Pid, StdStream),
     #[error("cannot run process")]
-    CannotRunProcess(#[source] anyhow::Error),
+    CannotRunProcess(Pid, #[source] std::io::Error),
 }
 
 #[derive(Error, Debug)]
 pub enum ChildInfoCreationWithCGroupError {
     #[error("error while child process creation")]
-    ChildInfoCreationError(#[source] ChildInfoCreationError),
+    ChildInfoCreationError(Pid, #[source] ChildInfoCreationError),
     #[error("cannot run process in cgroup")]
-    ProcessExecutionError(#[source] CGroupCommandError),
+    ProcessExecutionError(Pid, #[source] CGroupCommandError),
 }
 
 /// Type of the writable part of a mpsc channel for streaming output chunks to a client.
@@ -366,7 +365,7 @@ where
             limits,
         )
         .await
-        .map_err(ChildInfoCreationWithCGroupError::ProcessExecutionError)?;
+        .map_err(|err| ChildInfoCreationWithCGroupError::ProcessExecutionError(pid, err))?;
         Self::new_internal(
             pid,
             command,
@@ -374,7 +373,7 @@ where
             &process_path.as_ref(),
             Some(child_cgroup),
         )
-        .map_err(ChildInfoCreationWithCGroupError::ChildInfoCreationError)
+        .map_err(|err| ChildInfoCreationWithCGroupError::ChildInfoCreationError(pid, err))
     }
 
     fn new_internal<STR: AsRef<OsStr>>(
@@ -390,15 +389,16 @@ where
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command
-            .spawn()
-            .with_context(|| format!("[{}] Cannot run process - {:?}", pid, process_path.as_ref()))
-            .map_err(ChildInfoCreationError::CannotRunProcess)?;
+        let mut child = command.spawn().map_err(|err| {
+            info!("[{}] Cannot run process - {:?}", pid, process_path.as_ref());
+            ChildInfoCreationError::CannotRunProcess(pid, err)
+        })?;
 
         let stdout = child
             .stdout
             .take()
             .ok_or(ChildInfoCreationError::CannotCaptureStream(
+                pid,
                 StdStream::StdOut,
             ))?;
 
@@ -406,6 +406,7 @@ where
             .stderr
             .take()
             .ok_or(ChildInfoCreationError::CannotCaptureStream(
+                pid,
                 StdStream::StdErr,
             ))?;
 
@@ -448,7 +449,7 @@ where
         match status_rx.await {
             Ok(RunningState::Running) => Ok(None),
             Ok(RunningState::Finished(exit_status)) => Ok(Some(exit_status)),
-            _ => Err(StatusError::UnknownProcessStatus),
+            _ => Err(StatusError::UnknownProcessStatus(self.pid)),
         }
     }
 
@@ -463,7 +464,7 @@ where
             })?;
         match kill_rx.await {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(err)) => Err(StopError::CannotStopProcess(err)),
+            Ok(Err(err)) => Err(StopError::CannotStopProcess(self.pid, err)),
             Err(err) => {
                 error!("[{}] StopError::FailedToReceiveResponse", self.pid);
                 Err(StopError::FailedToReceiveResponse(err))

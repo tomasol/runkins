@@ -1,6 +1,6 @@
 use job_executor::job_executor_server::*;
 use job_executor::*;
-use jobexecutor::cgroup::runtime::CGroupLimits;
+use jobexecutor::cgroup::concepts::CGroupLimits;
 use jobexecutor::cgroup::server_config::CGroupConfig;
 use jobexecutor::cgroup::server_config::CGroupConfigBuilder;
 use jobexecutor::cgroup::server_config::CGroupConfigError;
@@ -50,14 +50,14 @@ impl MyJobExecutor {
 
     fn construct_limits(request_cgroup: CGroup) -> CGroupLimits {
         let mut limits = CGroupLimits {
-            cpu_limit: request_cgroup
-                .cpu_limit
-                .map(|cpu| jobexecutor::cgroup::runtime::CpuLimit {
+            cpu_limit: request_cgroup.cpu_limit.map(|cpu| {
+                jobexecutor::cgroup::concepts::CpuLimit {
                     cpu_max_quota_micros: cpu.cpu_max_quota_micros,
                     cpu_max_period_micros: cpu.cpu_max_period_micros,
-                }),
+                }
+            }),
             block_device_limit: request_cgroup.block_device_limit.map(|io| {
-                jobexecutor::cgroup::runtime::BlockDeviceLimit {
+                jobexecutor::cgroup::concepts::BlockDeviceLimit {
                     io_max_rbps: io.io_max_rbps,
                     io_max_riops: io.io_max_riops,
                     io_max_wbps: io.io_max_wbps,
@@ -341,7 +341,9 @@ pub mod tests {
         let chunk_to_output = |chunk: Chunk| -> String { format!("{:?}", chunk) };
 
         match ChildInfoGen::new(1, "", [], chunk_to_output) {
-            Err(ChildInfoCreationError::CannotRunProcess(_)) => {}
+            Err(ChildInfoCreationError::CannotRunProcess(pid, _)) => {
+                assert_eq!(pid, 1);
+            }
             Ok(_) => {
                 panic!("Unexpected Ok");
             }
