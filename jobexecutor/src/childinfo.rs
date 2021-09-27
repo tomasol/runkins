@@ -21,7 +21,7 @@ use crate::cgroup::server_config::ChildCGroup;
 
 #[derive(Error, Debug)]
 pub enum StopError {
-    #[error("cannot stop the child process")]
+    #[error("[{0}] cannot stop the child process")]
     CannotStopProcess(Pid, #[source] std::io::Error),
     #[error("main_actor is no longer running")] // TODO: panic instead?
     MainActorFinished,
@@ -37,7 +37,7 @@ pub enum AddClientError {
 
 #[derive(Error, Debug)]
 pub enum StatusError {
-    #[error("cannot get the child process status")]
+    #[error("[{0}] cannot get the child process status")]
     UnknownProcessStatus(Pid),
     #[error("main_actor is no longer running")] // TODO: panic instead?
     MainActorFinished,
@@ -45,17 +45,17 @@ pub enum StatusError {
 
 #[derive(Error, Debug)]
 pub enum ChildInfoCreationError {
-    #[error("cannot capture {0:?} of the child process")]
+    #[error("[{0}] cannot capture {1:?} of the child process")]
     CannotCaptureStream(Pid, StdStream),
-    #[error("cannot run process")]
+    #[error("[{0}] cannot run process")]
     CannotRunProcess(Pid, #[source] std::io::Error),
 }
 
 #[derive(Error, Debug)]
 pub enum ChildInfoCreationWithCGroupError {
-    #[error("error while child process creation")]
+    #[error("[{0}] error while child process creation")]
     ChildInfoCreationError(Pid, #[source] ChildInfoCreationError),
-    #[error("cannot run process in cgroup")]
+    #[error("[{0}] cannot run process in cgroup")]
     ProcessExecutionError(Pid, #[source] CGroupCommandError),
 }
 
