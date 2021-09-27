@@ -112,6 +112,20 @@ pub enum StdStream {
 // buffer capacity set arbitrarily
 const CHUNK_BUF_CAPACITY: usize = 1024;
 
+pub fn spawn_named<T>(
+    _name: &str,
+    future: impl std::future::Future<Output = T> + Send + 'static,
+) -> tokio::task::JoinHandle<T>
+where
+    T: Send + 'static,
+{
+    #[cfg(tokio_unstable)]
+    return tokio::task::Builder::new().name(_name).spawn(future);
+
+    #[cfg(not(tokio_unstable))]
+    tokio::spawn(future)
+}
+
 /// ChildInfo represents the started process, its state, output and all associated data.
 /// It starts several async tasks to keep track of the output and running status.
 /// Note about generic types:
@@ -412,18 +426,19 @@ where
 
         let (tx, rx) = mpsc::channel(1);
         // TODO benchmark against one giant select!
-        tokio::spawn(async move {
+
+        spawn_named(&format!("[{}] main_actor", pid), async move {
             ChildInfo::main_actor(pid, rx, child, chunk_to_output).await;
         });
         {
             let tx = tx.clone();
-            tokio::spawn(async move {
+            spawn_named(&format!("[{}] stdout_forwarder", pid), async move {
                 ChildInfo::std_forwarder(pid, tx, stdout, StdStream::StdOut).await;
             });
         }
         {
             let tx = tx.clone();
-            tokio::spawn(async move {
+            spawn_named(&format!("[{}] stderr_forwarder", pid), async move {
                 ChildInfo::std_forwarder(pid, tx, stderr, StdStream::StdErr).await;
             });
         }

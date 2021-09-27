@@ -35,10 +35,9 @@ cargo run --bin jobexecutor-server
 This will start the gRPC server on (currently hardcoded)
 `localhost:50051`. The CLI has the same hardcoded address.
 
-To see the error logs in the console, use
+To see the error logs in the terminal, use
 ```sh
 export RUST_LOG=jobexecutor_server=debug,jobexecutor=debug,info
-cargo run --bin jobexecutor-server
  ```
 
 ### CLI

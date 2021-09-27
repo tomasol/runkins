@@ -326,6 +326,10 @@ async fn run_server() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    {
+        #[cfg(tokio_unstable)]
+        console_subscriber::init();
+    }
     env_logger::init();
     run_server().await
 }
