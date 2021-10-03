@@ -154,6 +154,32 @@ pub mod server_config {
                 err
             })
         }
+
+        pub fn as_auto_clean(&self) -> AutoCleanChildCGroup {
+            AutoCleanChildCGroup {
+                path: self.path.clone(),
+            }
+        }
+    }
+
+    pub struct AutoCleanChildCGroup {
+        path: std::path::PathBuf,
+    }
+
+    impl Drop for AutoCleanChildCGroup {
+        fn drop(&mut self) {
+            debug!("Deleting {:?}", &self.path);
+            // TODO: this will fail if the child process forked
+            // For production, forking/cloning might not be an issue
+            // or killing of all processes in cgroup.procs might be needed.
+            let del_result = std::fs::remove_dir(&self.path);
+            if let Err(err) = del_result {
+                error!(
+                    "AutoClean failed - cannot remove cgroup {:?} - {}",
+                    &self.path, err
+                );
+            }
+        }
     }
 }
 

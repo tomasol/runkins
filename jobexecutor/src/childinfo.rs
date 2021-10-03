@@ -2,6 +2,7 @@ use log::*;
 use std::ffi::OsStr;
 use std::process::ExitStatus;
 use std::process::Stdio;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
@@ -16,6 +17,7 @@ use tokio::sync::oneshot::error::RecvError;
 use crate::cgroup::concepts::CGroupLimits;
 use crate::cgroup::runtime::CGroupCommandError;
 use crate::cgroup::runtime::CGroupCommandFactory;
+use crate::cgroup::server_config::AutoCleanChildCGroup;
 use crate::cgroup::server_config::CGroupConfig;
 use crate::cgroup::server_config::ChildCGroup;
 
@@ -67,11 +69,12 @@ pub type Pid = u64;
 #[derive(Debug)]
 enum ActorEvent<OUTPUT> {
     ChunkAdded(Chunk),                                 // sent by std_forwarder
-    ClientAdded(ClientTx<OUTPUT>),                     // send by API call
+    ClientAdded(ClientTx<OUTPUT>),                     // sent by API call
     ProcessFinished(std::io::Result<ExitStatus>),      // internal to main_actor
-    StatusRequest(oneshot::Sender<RunningState>),      // send by API call
-    KillRequest(oneshot::Sender<std::io::Result<()>>), // send by API call
-    StreamFinished(StdStream),                         // Sent by std_forwarder tasks
+    StatusRequest(oneshot::Sender<RunningState>),      // sent by API call
+    KillRequest(oneshot::Sender<std::io::Result<()>>), // sent by API call
+    StreamFinished(StdStream),                         // sent by std_forwarder tasks
+    GetCurrentChunks(oneshot::Sender<Vec<Chunk>>),     // sent by API call
 }
 
 #[derive(Debug)]
@@ -92,6 +95,22 @@ impl Chunk {
         match std_stream {
             StdStream::StdOut => Chunk::StdOut(content),
             StdStream::StdErr => Chunk::StdErr(content),
+        }
+    }
+
+    pub fn std_out(&self) -> &[u8] {
+        if let Chunk::StdOut(content) = self {
+            content
+        } else {
+            &[]
+        }
+    }
+
+    pub fn std_err(&self) -> &[u8] {
+        if let Chunk::StdErr(content) = self {
+            content
+        } else {
+            &[]
         }
     }
 }
@@ -143,6 +162,39 @@ where
                 error!("[{}] Cannot add_client: {}", self.pid, err);
                 AddClientError::MainActorFinished
             })
+    }
+
+    pub async fn output(&self) -> Result<(ExitStatus, Vec<Chunk>), StatusError> {
+        let status = loop {
+            match self.status().await? {
+                Some(status) => {
+                    break status;
+                }
+                // FIXME: receive a notification instead of polling
+                None => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        };
+        let (response_tx, response_rx) = oneshot::channel();
+        self.actor_tx
+            .send(ActorEvent::GetCurrentChunks(response_tx))
+            .await
+            .map_err(|err| {
+                error!(
+                    "[{}] output() failed to send to actor_tx: {}",
+                    self.pid, err
+                );
+                StatusError::MainActorFinished
+            })?;
+        let chunks = response_rx.await.map_err(|err| {
+            error!(
+                "[{}] output() failed to read response_rx: {}",
+                self.pid, err
+            );
+            StatusError::MainActorFinished
+        })?;
+        Ok((status, chunks))
     }
 
     // Async task that reads StdStream and sends it in chunks
@@ -233,6 +285,7 @@ where
                     running_state,
                     stream_finished_event_count
                 );
+            // FIXME: cleanup resources when panicing in main_actor
             match event {
                 ActorEvent::ProcessFinished(running_status) => {
                     // created by child.wait arm of select! above
@@ -278,6 +331,12 @@ where
                                 pid, client_tx
                             );
                         // TODO test that in this state the RPC disconnects the client
+                    }
+                }
+                ActorEvent::GetCurrentChunks(response_tx) => {
+                    let send_result = response_tx.send(chunks.clone());
+                    if send_result.is_err() {
+                        debug!("[{}] main_actor cannot reply to GetCurrentChunks", pid);
                     }
                 }
                 ActorEvent::StatusRequest(status_tx) => {
@@ -449,6 +508,8 @@ where
         })
     }
 
+    // If process is still running, return Ok(None)
+    // If the process finished, return Ok(Some(ExitStatus))
     pub async fn status(&self) -> Result<Option<ExitStatus>, StatusError> {
         let (status_tx, status_rx) = oneshot::channel();
         self.actor_tx
@@ -493,5 +554,209 @@ where
         } else {
             Ok(())
         }
+    }
+
+    pub fn as_auto_clean(&self) -> Option<AutoCleanChildCGroup> {
+        self.child_cgroup
+            .as_ref()
+            .map(|child_cgroup| child_cgroup.as_auto_clean())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::cgroup::server_config::{CGroupConfig, CGroupConfigBuilder};
+    use anyhow::{anyhow, bail, Context};
+    use envconfig::Envconfig;
+
+    #[derive(Debug, Envconfig)]
+    struct EnvVarConfiguration {
+        #[envconfig(from = "CGEXEC_RS")]
+        cgexec_rs: Option<String>,
+        #[envconfig(from = "CGROUP_MOUNT_POINT", default = "/sys/fs/cgroup")]
+        cgroup_mount_point: String,
+        #[envconfig(from = "PARENT_CGROUP")]
+        parent_cgroup: Option<String>,
+        #[envconfig(from = "CGROUP_BLOCK_DEVICE_ID", default = "8:0")]
+        block_device_id: String,
+        #[envconfig(from = "SLICE_NAME", default = "my.slice")]
+        slice_name: String,
+    }
+
+    impl EnvVarConfiguration {
+        fn new() -> Result<EnvVarConfiguration, anyhow::Error> {
+            let conf = Self::init_from_env();
+            debug!("From env.vars: {:?}", conf);
+            Ok(conf?)
+        }
+    }
+
+    #[derive(Debug)]
+    struct DetectedCgroupConfiguration {
+        cgexec_rs: PathBuf,
+        parent_cgroup: String,
+        block_device_id: String,
+    }
+
+    impl DetectedCgroupConfiguration {
+        async fn new(
+            conf: &EnvVarConfiguration,
+        ) -> Result<DetectedCgroupConfiguration, anyhow::Error> {
+            let parent_cgroup = match &conf.parent_cgroup {
+                Some(parent_cgroup) => parent_cgroup.clone(),
+                None => {
+                    DetectedCgroupConfiguration::find_parent_cgroup_using_systemd_slice(&conf)
+                        .await?
+                }
+            };
+            let cgexec_rs = DetectedCgroupConfiguration::find_cgexec_rs(conf.cgexec_rs.as_ref())?;
+            if !parent_cgroup.starts_with(&conf.cgroup_mount_point) {
+                bail!(
+                    "parent_cgroup {} does not start with {}",
+                    parent_cgroup,
+                    conf.cgroup_mount_point
+                );
+            }
+
+            let conf = DetectedCgroupConfiguration {
+                cgexec_rs,
+                parent_cgroup,
+                block_device_id: conf.block_device_id.clone(),
+            };
+            debug!("Detected: {:?}", conf);
+            Ok(conf)
+        }
+
+        fn find_cgexec_rs(cgexec_rs: Option<&String>) -> Result<PathBuf, anyhow::Error> {
+            Ok(if let Some(path) = cgexec_rs {
+                path.into()
+            } else {
+                trace!("Guessing cgexec-rs location based on current_exe");
+                let exe = std::env::current_exe()?;
+                exe.parent()
+                    .ok_or(anyhow!("Cannot "))?
+                    .join("..")
+                    .join("cgexec-rs")
+            })
+        }
+
+        async fn find_parent_cgroup_using_systemd_slice(
+            conf: &EnvVarConfiguration,
+        ) -> Result<String, anyhow::Error> {
+            let output = Command::new("systemd-run")
+                .args(&[
+                    "--user",
+                    "-p",
+                    "Delegate=yes",
+                    &format!("--slice={}", conf.slice_name),
+                    "-P",
+                    "--",
+                    "cat",
+                    "/proc/self/cgroup",
+                ])
+                .output()
+                .await?;
+
+            if !output.status.success() {
+                bail!("Running systemd-run failed");
+            }
+            let stdout = String::from_utf8(output.stdout)?;
+            let parent_cgroup =
+                get_parent_cgroup_from_proc_self_cgroup(&stdout, &conf.cgroup_mount_point)?;
+            Ok(parent_cgroup.to_string_lossy().to_string())
+        }
+    }
+
+    impl Into<CGroupConfigBuilder> for DetectedCgroupConfiguration {
+        fn into(self) -> CGroupConfigBuilder {
+            CGroupConfigBuilder {
+                parent_cgroup: self.parent_cgroup.into(),
+                cgexec_rs: self.cgexec_rs,
+                move_current_pid_to_subfolder: false,
+                cgroup_block_device_id: self.block_device_id,
+            }
+        }
+    }
+
+    const EXPECTED_PROC_SELF_CGROUP_PREFIX: &str = "0::/";
+    fn parse_proc_self_cgroup<'a>(stdout: &'a str) -> &'a str {
+        debug!("/proc/self/cgroup: {}", stdout);
+        assert!(
+            stdout.starts_with(EXPECTED_PROC_SELF_CGROUP_PREFIX),
+            "Unexpected prefix: {}",
+            stdout
+        );
+        assert!(stdout.ends_with("\n"), "Unexpected suffix: {}", stdout);
+        &stdout[EXPECTED_PROC_SELF_CGROUP_PREFIX.len()..stdout.len() - 1]
+    }
+
+    fn get_parent_cgroup_from_proc_self_cgroup(
+        stdout: &str,
+        cgroup_mount_point: &str,
+    ) -> Result<PathBuf, anyhow::Error> {
+        let parsed_subpath = PathBuf::from(parse_proc_self_cgroup(&stdout));
+        let parsed_subpath = parsed_subpath
+            .parent()
+            .ok_or(anyhow!("Cannot get parent {}", parsed_subpath.display()))?;
+        let abs_path = PathBuf::from(cgroup_mount_point).join(parsed_subpath);
+        abs_path
+            .canonicalize()
+            .with_context(|| format!("Cannot canonicaize {:?}", abs_path))
+    }
+
+    #[test]
+    fn test_parse_proc_self_cgroup() {
+        assert_eq!(parse_proc_self_cgroup("0::/bar/baz\n"), "bar/baz");
+    }
+
+    #[cfg(test_systemd_run)]
+    #[tokio::test]
+    async fn test_cgroup() -> Result<(), anyhow::Error> {
+        env_logger::init();
+        let pid = 1;
+        let env_conf = EnvVarConfiguration::new()?;
+        let conf = DetectedCgroupConfiguration::new(&env_conf).await?;
+        let cgroup_config_builder: CGroupConfigBuilder = conf.into();
+
+        let expected_path = cgroup_config_builder
+            .parent_cgroup
+            .as_path()
+            .join(format!("{}", pid));
+        let cgroup_config = CGroupConfig::new(cgroup_config_builder).await?;
+        let limits = Default::default();
+        // FIXME: refactor, remove chunk_to_output from API
+        let chunk_to_output = |chunk: Chunk| -> String { format!("{:?}", chunk) };
+        let child_info = ChildInfo::new_with_cgroup(
+            pid,
+            "cat".to_string(),
+            vec!["/proc/self/cgroup".to_string()].into_iter(),
+            chunk_to_output,
+            &cgroup_config,
+            limits,
+        )
+        .await?;
+        let _clean = child_info.as_auto_clean();
+        let (exit_status, chunks) = child_info.output().await?;
+        debug!("Child process status: {}", exit_status);
+        assert!(
+            exit_status.success(),
+            "Running child process was not successful"
+        );
+        let out_bytes: Vec<u8> = chunks
+            .iter()
+            .map(|ch| ch.std_out())
+            .flatten()
+            .cloned()
+            .collect();
+        let stdout = String::from_utf8(out_bytes)?;
+        let parent_cgroup =
+            get_parent_cgroup_from_proc_self_cgroup(&stdout, &env_conf.cgroup_mount_point)?;
+        let child_path = parent_cgroup.join(format!("{}", pid));
+
+        assert_eq!(child_path, expected_path);
+        Ok(())
     }
 }

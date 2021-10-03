@@ -6,6 +6,12 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process;
 
+// TODO: remove
+/*
+https://docs.rs/tokio/1.12.0/tokio/process/struct.Command.html#method.pre_exec
+https://fasterthanli.me/articles/a-terminal-case-of-linux
+*/
+
 fn attach_process_to_cgroup(pid: u32, cgroup_string: &str) -> Result<()> {
     // TODO parse args using structopt
     let cgroup_path = Path::new(cgroup_string);
