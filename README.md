@@ -77,7 +77,12 @@ use `slow 1 3`, which will end with status `Exited with code 3`.
 Killing the `slow` process using `killall slow` or `stop` RPC should end with status `Exited with signal`.
 
 ### Automated testing
-Not implemented yet.
+Run
+```sh
+cargo test
+```
+To execute tests that are dependent on cgroup v2 and systemd-run, enable `test_systemd_run` configuration
+either via `RUST_FLAGS` or `.cargo/config`.
 
 ## cgroup support
 Please read [cgexec-rs](cgexec-rs/README.md) and verify it is working as described.
