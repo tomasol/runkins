@@ -44,6 +44,12 @@ pub enum StatusError {
 }
 
 #[derive(Error, Debug)]
+pub enum OutputError {
+    #[error("main_actor is no longer running")] // TODO: panic instead?
+    MainActorFinished,
+}
+
+#[derive(Error, Debug)]
 pub enum ChildInfoCreationError {
     #[error("[{0}] cannot capture {1:?} of the child process")]
     CannotCaptureStream(Pid, StdStream),
@@ -196,22 +202,21 @@ where
             })
     }
 
-    pub async fn output(&self) -> Result<(CompleteExitStatus, Vec<Chunk>), StatusError> {
-        // TODO OutputError
+    pub async fn output(&self) -> Result<(CompleteExitStatus, Vec<Chunk>), OutputError> {
         let (oneshot_tx, oneshot_rx) = oneshot::channel();
         self.actor_tx
             .send(ActorEvent::NotifyWhenProcessFinishes(oneshot_tx))
             .await
             .map_err(|_| {
                 error!("[{}] StatusError::MainActorFinished", self.pid);
-                StatusError::MainActorFinished
+                OutputError::MainActorFinished
             })?;
         let status = oneshot_rx.await.map_err(|err| {
             error!(
                 "[{}] output() failed to read response_rx: {}",
                 self.pid, err
             );
-            StatusError::MainActorFinished
+            OutputError::MainActorFinished
         })?;
 
         let (response_tx, response_rx) = oneshot::channel();
@@ -223,14 +228,14 @@ where
                     "[{}] output() failed to send to actor_tx: {}",
                     self.pid, err
                 );
-                StatusError::MainActorFinished
+                OutputError::MainActorFinished
             })?;
         let chunks = response_rx.await.map_err(|err| {
             error!(
                 "[{}] output() failed to read response_rx: {}",
                 self.pid, err
             );
-            StatusError::MainActorFinished
+            OutputError::MainActorFinished
         })?;
         Ok((status, chunks))
     }
