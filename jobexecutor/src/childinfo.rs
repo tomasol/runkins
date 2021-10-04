@@ -1,8 +1,13 @@
+use crate::cgroup::concepts::CGroupLimits;
+use crate::cgroup::runtime::CGroupCommandError;
+use crate::cgroup::runtime::CGroupCommandFactory;
+use crate::cgroup::server_config::AutoCleanChildCGroup;
+use crate::cgroup::server_config::CGroupConfig;
+use crate::cgroup::server_config::ChildCGroup;
 use log::*;
 use std::ffi::OsStr;
 use std::process::ExitStatus;
 use std::process::Stdio;
-use std::time::Duration;
 use thiserror::Error;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
@@ -13,13 +18,6 @@ use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::RecvError;
-
-use crate::cgroup::concepts::CGroupLimits;
-use crate::cgroup::runtime::CGroupCommandError;
-use crate::cgroup::runtime::CGroupCommandFactory;
-use crate::cgroup::server_config::AutoCleanChildCGroup;
-use crate::cgroup::server_config::CGroupConfig;
-use crate::cgroup::server_config::ChildCGroup;
 
 #[derive(Error, Debug)]
 pub enum StopError {
@@ -70,11 +68,12 @@ pub type Pid = u64;
 enum ActorEvent<OUTPUT> {
     ChunkAdded(Chunk),                                 // sent by std_forwarder
     ClientAdded(ClientTx<OUTPUT>),                     // sent by API call
-    ProcessFinished(std::io::Result<ExitStatus>),      // internal to main_actor
+    ProcessFinished(CompleteExitStatus),               // internal to main_actor
     StatusRequest(oneshot::Sender<RunningState>),      // sent by API call
     KillRequest(oneshot::Sender<std::io::Result<()>>), // sent by API call
     StdStreamFinished(StdStream),                      // sent by std_forwarder tasks
     GetCurrentChunks(oneshot::Sender<Vec<Chunk>>),     // sent by API call
+    NotifyWhenProcessFinishes(oneshot::Sender<CompleteExitStatus>), // sent by API call
 }
 
 #[derive(Debug)]
@@ -118,8 +117,18 @@ impl Chunk {
 #[derive(Debug, PartialEq, Clone)]
 enum RunningState {
     Running,
-    WaitFailed,
+    WaitFailed, // TODO rename to Unknown
     Finished(ExitStatus),
+}
+
+impl RunningState {
+    fn new(status_result: &Option<CompleteExitStatus>) -> RunningState {
+        match status_result {
+            None => RunningState::Running,
+            Some(CompleteExitStatus::Complete(exit_status)) => RunningState::Finished(*exit_status),
+            Some(CompleteExitStatus::Unknown(_)) => RunningState::WaitFailed,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -145,6 +154,30 @@ where
     tokio::spawn(future)
 }
 
+#[derive(Debug, Clone)]
+pub enum CompleteExitStatus {
+    Complete(ExitStatus),
+    Unknown(String),
+}
+
+impl CompleteExitStatus {
+    fn success(&self) -> bool {
+        match self {
+            CompleteExitStatus::Complete(status) => status.success(),
+            _ => false,
+        }
+    }
+}
+
+impl From<std::io::Result<ExitStatus>> for CompleteExitStatus {
+    fn from(src: std::io::Result<ExitStatus>) -> Self {
+        match src {
+            Ok(status) => CompleteExitStatus::Complete(status),
+            Err(err) => CompleteExitStatus::Unknown(err.to_string()),
+        }
+    }
+}
+
 /// ChildInfo represents the started process, its state, output and all associated data.
 /// It starts several async tasks to keep track of the output and running status.
 /// Note about generic types:
@@ -164,18 +197,24 @@ where
             })
     }
 
-    pub async fn output(&self) -> Result<(ExitStatus, Vec<Chunk>), StatusError> {
-        let status = loop {
-            match self.status().await? {
-                Some(status) => {
-                    break status;
-                }
-                // FIXME: receive a notification instead of polling
-                None => {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            }
-        };
+    pub async fn output(&self) -> Result<(CompleteExitStatus, Vec<Chunk>), StatusError> {
+        // TODO OutputError
+        let (oneshot_tx, oneshot_rx) = oneshot::channel();
+        self.actor_tx
+            .send(ActorEvent::NotifyWhenProcessFinishes(oneshot_tx))
+            .await
+            .map_err(|_| {
+                error!("[{}] StatusError::MainActorFinished", self.pid);
+                StatusError::MainActorFinished
+            })?;
+        let status = oneshot_rx.await.map_err(|err| {
+            error!(
+                "[{}] output() failed to read response_rx: {}",
+                self.pid, err
+            );
+            StatusError::MainActorFinished
+        })?;
+
         let (response_tx, response_rx) = oneshot::channel();
         self.actor_tx
             .send(ActorEvent::GetCurrentChunks(response_tx))
@@ -262,14 +301,29 @@ where
         debug!("[{}] actor started", pid);
         let mut chunks: Vec<Chunk> = vec![];
         let mut clients: Vec<ClientTx<OUTPUT>> = vec![];
-        let mut running_state = RunningState::Running; // used for StatusRequest reporting
+        let mut exit_status = None;
         let mut stream_finished_event_count = 0; // chunks is complete only when both events are received
+        let mut exit_listeners: Vec<oneshot::Sender<CompleteExitStatus>> = vec![];
+
+        fn send_back<T>(tx: oneshot::Sender<T>, reply: T, pid: Pid, event: &str) {
+            let send_result = tx.send(reply);
+            if send_result.is_err() {
+                debug!("[{}] main_actor cannot respond to {}", pid, event);
+            }
+        }
 
         loop {
             let event = tokio::select! {
-                exit_status_result = child.wait(), if running_state == RunningState::Running => {
-                    debug!("[{}] main_actor finished waiting for child process: {:?}", pid, exit_status_result);
-                    ActorEvent::ProcessFinished(exit_status_result)
+                new_status = child.wait(), if exit_status.is_none() => {
+                    if new_status.is_ok() {
+                        debug!("[{}] main_actor finished waiting for child process: {:?}", pid, new_status);
+                    } else {
+                        warn!(
+                            "[{}] main_actor failed waiting for child process - {:?}",
+                            pid, new_status
+                        );
+                    }
+                    ActorEvent::ProcessFinished(new_status.into())
                 },
                 Some(event) = rx.recv() => {
                     event
@@ -280,28 +334,27 @@ where
                 }
             };
             trace!(
-                    "[{}] main_actor event={:?}, chunks={}, clients={}, running_state={:?}, stream_finished_event_count={}",
+                    "[{}] main_actor event={:?}, chunks={}, clients={}, exit_status={:?}, stream_finished_event_count={}",
                     pid,
                     event,
                     chunks.len(),
                     clients.len(),
-                    running_state,
+                    exit_status,
                     stream_finished_event_count
                 );
             // FIXME: cleanup resources when panicing in main_actor
             match event {
-                ActorEvent::ProcessFinished(running_status) => {
-                    // created by child.wait arm of select! above
-                    running_state = match running_status {
-                        Ok(exit_status) => RunningState::Finished(exit_status),
-                        Err(err) => {
-                            warn!(
-                                "[{}] main_actor failed waiting for child process - {}",
-                                pid, err
-                            );
-                            RunningState::WaitFailed
-                        }
-                    };
+                ActorEvent::ProcessFinished(new_status) => {
+                    exit_listeners.drain(..).for_each(|listener| {
+                        send_back(
+                            listener,
+                            new_status.clone(),
+                            pid,
+                            "NotifyWhenProcessFinishes",
+                        );
+                    });
+                    // update status
+                    exit_status = Some(new_status);
                 }
                 ActorEvent::ChunkAdded(chunk) => {
                     assert!(
@@ -337,22 +390,18 @@ where
                     }
                 }
                 ActorEvent::GetCurrentChunks(response_tx) => {
-                    let send_result = response_tx.send(chunks.clone());
-                    if send_result.is_err() {
-                        debug!("[{}] main_actor cannot reply to GetCurrentChunks", pid);
-                    }
+                    send_back(response_tx, chunks.clone(), pid, "GetCurrentChunks");
                 }
                 ActorEvent::StatusRequest(status_tx) => {
-                    let send_result = status_tx.send(running_state.clone());
-                    if send_result.is_err() {
-                        debug!("[{}] main_actor cannot reply to StatusRequest", pid);
-                    }
+                    send_back(
+                        status_tx,
+                        RunningState::new(&exit_status),
+                        pid,
+                        "StatusRequest",
+                    );
                 }
                 ActorEvent::KillRequest(kill_tx) => {
-                    let send_result = kill_tx.send(child.kill().await);
-                    if send_result.is_err() {
-                        debug!("[{}] main_actor cannot reply to KillRequest", pid);
-                    }
+                    send_back(kill_tx, child.kill().await, pid, "KillRequest");
                 }
                 ActorEvent::StdStreamFinished(_) => {
                     stream_finished_event_count += 1;
@@ -363,7 +412,19 @@ where
                     );
                     if stream_finished_event_count == 2 {
                         // disconnect all clients, there will be no new chunks
+                        // TODO do this on process exit, remove event
                         clients.clear();
+                    }
+                }
+                ActorEvent::NotifyWhenProcessFinishes(listener) => {
+                    // either send the reply now or add to listeners
+                    match exit_status {
+                        None => {
+                            exit_listeners.push(listener);
+                        }
+                        Some(ref status) => {
+                            send_back(listener, status.clone(), pid, "NotifyWhenProcessFinishes");
+                        }
                     }
                 }
             }
@@ -516,6 +577,7 @@ where
     // If process is still running, return Ok(None)
     // If the process finished, return Ok(Some(ExitStatus))
     pub async fn status(&self) -> Result<Option<ExitStatus>, StatusError> {
+        // FIXME return Result<RunningState, StatusError>
         let (status_tx, status_rx) = oneshot::channel();
         self.actor_tx
             .send(ActorEvent::StatusRequest(status_tx))
@@ -704,7 +766,7 @@ mod tests {
         let (exit_status, chunks) = child_info.output().await?;
         assert!(
             exit_status.success(),
-            "Running child process was not successful - {}",
+            "Running child process was not successful - {:?}",
             exit_status
         );
         let out_bytes: Vec<u8> = chunks
