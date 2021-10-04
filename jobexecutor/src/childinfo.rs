@@ -71,7 +71,6 @@ enum ActorEvent<OUTPUT> {
     ProcessFinished(CompleteExitStatus),               // internal to main_actor
     StatusRequest(oneshot::Sender<RunningState>),      // sent by API call
     KillRequest(oneshot::Sender<std::io::Result<()>>), // sent by API call
-    StdStreamFinished(StdStream),                      // sent by std_forwarder tasks
     GetCurrentChunks(oneshot::Sender<Vec<Chunk>>),     // sent by API call
     NotifyWhenProcessFinishes(oneshot::Sender<CompleteExitStatus>), // sent by API call
 }
@@ -161,7 +160,7 @@ pub enum CompleteExitStatus {
 }
 
 impl CompleteExitStatus {
-    fn success(&self) -> bool {
+    fn is_success(&self) -> bool {
         match self {
             CompleteExitStatus::Complete(status) => status.success(),
             _ => false,
@@ -280,16 +279,6 @@ where
                 }
             }
         }
-        if tx
-            .send(ActorEvent::StdStreamFinished(std_stream))
-            .await
-            .is_err()
-        {
-            warn!(
-                "[{}] std_forwarder was unable to send StdStreamFinished",
-                pid
-            );
-        }
     }
 
     async fn main_actor<F: Fn(Chunk) -> OUTPUT>(
@@ -302,7 +291,6 @@ where
         let mut chunks: Vec<Chunk> = vec![];
         let mut clients: Vec<ClientTx<OUTPUT>> = vec![];
         let mut exit_status = None;
-        let mut stream_finished_event_count = 0; // chunks is complete only when both events are received
         let mut exit_listeners: Vec<oneshot::Sender<CompleteExitStatus>> = vec![];
 
         fn send_back<T>(tx: oneshot::Sender<T>, reply: T, pid: Pid, event: &str) {
@@ -334,14 +322,13 @@ where
                 }
             };
             trace!(
-                    "[{}] main_actor event={:?}, chunks={}, clients={}, exit_status={:?}, stream_finished_event_count={}",
-                    pid,
-                    event,
-                    chunks.len(),
-                    clients.len(),
-                    exit_status,
-                    stream_finished_event_count
-                );
+                "[{}] main_actor event={:?}, chunks={}, clients={}, exit_status={:?}",
+                pid,
+                event,
+                chunks.len(),
+                clients.len(),
+                exit_status,
+            );
             // FIXME: cleanup resources when panicing in main_actor
             match event {
                 ActorEvent::ProcessFinished(new_status) => {
@@ -353,15 +340,12 @@ where
                             "NotifyWhenProcessFinishes",
                         );
                     });
+                    // disconnect clients
+                    clients.clear();
                     // update status
                     exit_status = Some(new_status);
                 }
                 ActorEvent::ChunkAdded(chunk) => {
-                    assert!(
-                            stream_finished_event_count < 2,
-                            "[{}] main_actor in illegal state - ChunkAdded after receiving both StdStreamFinished events",
-                            pid
-                        );
                     // notify all clients, removing disconnected
                     clients.retain(|client_tx| {
                         ChildInfo::send_chunk(pid, client_tx, chunk.clone(), &chunk_to_output)
@@ -377,8 +361,8 @@ where
                     let send_result =
                         ChildInfo::send_everything(pid, &client_tx, &chunks, &chunk_to_output);
                     if send_result.is_ok() {
-                        if stream_finished_event_count < 2 {
-                            // add to clients
+                        if exit_status.is_none() {
+                            // still running
                             clients.push(client_tx);
                         } // otherwise drop client_tx which will disconnect the client
                     } else {
@@ -402,19 +386,6 @@ where
                 }
                 ActorEvent::KillRequest(kill_tx) => {
                     send_back(kill_tx, child.kill().await, pid, "KillRequest");
-                }
-                ActorEvent::StdStreamFinished(_) => {
-                    stream_finished_event_count += 1;
-                    assert!(
-                        stream_finished_event_count <= 2,
-                        "[{}] Illegal StdStreamFinished count",
-                        pid
-                    );
-                    if stream_finished_event_count == 2 {
-                        // disconnect all clients, there will be no new chunks
-                        // TODO do this on process exit, remove event
-                        clients.clear();
-                    }
                 }
                 ActorEvent::NotifyWhenProcessFinishes(listener) => {
                     // either send the reply now or add to listeners
@@ -765,7 +736,7 @@ mod tests {
     ) -> Result<String, anyhow::Error> {
         let (exit_status, chunks) = child_info.output().await?;
         assert!(
-            exit_status.success(),
+            exit_status.is_success(),
             "Running child process was not successful - {:?}",
             exit_status
         );
