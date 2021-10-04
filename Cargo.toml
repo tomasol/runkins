@@ -2,7 +2,6 @@
 
 members = [
   "jobexecutor",
-  "cgexec-rs",
   "server",
   "cli",
   "testing",

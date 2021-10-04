@@ -21,8 +21,6 @@ pub mod server_config {
     pub enum CGroupConfigError {
         #[error("parent_cgroup must be an absolute path to a directory")]
         WrongParentCGroup,
-        #[error("cgexec_rs must be an absolute path to a file")]
-        WrongCGExecRs,
         #[error("file is in the way of service cgroup - {0}")]
         WrongServiceCGroup(PathBuf),
         #[error("cannot create service cgroup directory")]
@@ -34,7 +32,6 @@ pub mod server_config {
     #[derive(Debug)]
     pub struct CGroupConfigBuilder {
         pub parent_cgroup: PathBuf,
-        pub cgexec_rs: PathBuf,
         pub cgroup_block_device_id: String,
         pub move_current_pid_to_subfolder: bool,
     }
@@ -42,7 +39,6 @@ pub mod server_config {
     #[derive(Debug, Clone)]
     pub struct CGroupConfig {
         parent_cgroup: PathBuf,
-        cgexec_rs: PathBuf,
         cgroup_block_device_id: String,
     }
 
@@ -53,15 +49,11 @@ pub mod server_config {
         pub async fn new(builder: CGroupConfigBuilder) -> Result<CGroupConfig, CGroupConfigError> {
             debug!("Configuring cgroup support: {:?}", builder);
             let parent_cgroup = builder.parent_cgroup;
-            let cgexec_rs = builder.cgexec_rs;
             if !parent_cgroup.is_absolute() || !parent_cgroup.is_dir() {
                 Err(CGroupConfigError::WrongParentCGroup)
-            } else if !cgexec_rs.is_absolute() || !cgexec_rs.is_file() {
-                Err(CGroupConfigError::WrongCGExecRs)
             } else {
                 let cgroup_config = CGroupConfig {
                     parent_cgroup,
-                    cgexec_rs,
                     cgroup_block_device_id: builder.cgroup_block_device_id,
                 };
                 if builder.move_current_pid_to_subfolder {
@@ -69,10 +61,6 @@ pub mod server_config {
                 }
                 Ok(cgroup_config)
             }
-        }
-
-        pub fn cgexec_rs(&self) -> &PathBuf {
-            &self.cgexec_rs
         }
 
         pub fn cgroup_block_device_id(&self) -> &str {
@@ -207,7 +195,7 @@ pub mod runtime {
         /// Create new [`Command`] using program name and arguments.
         /// If cgroup_config is set to support cgroup, new cgroup will
         /// be created no matter if limits are provided or not.
-        pub async fn create_command<ITER, STR>(
+        pub async fn create_command<ITER, STR, STR2>(
             cgroup_config: &CGroupConfig,
             pid: Pid,
             program: &STR,
@@ -215,8 +203,9 @@ pub mod runtime {
             limits: CGroupLimits,
         ) -> Result<(Command, ChildCGroup), CGroupCommandError>
         where
-            ITER: ExactSizeIterator<Item = STR>,
+            ITER: ExactSizeIterator<Item = STR2>,
             STR: AsRef<OsStr>,
+            STR2: AsRef<OsStr>,
         {
             let child_cgroup = cgroup_config
                 .create_child_cgroup_folder(pid)
@@ -251,15 +240,27 @@ pub mod runtime {
                 }
             }?;
 
-            let mut command = Command::new(cgroup_config.cgexec_rs());
-            // first argument is the cgroup name
-            let mut new_args = Vec::with_capacity(args.len() + 2);
-            new_args.push(child_cgroup.as_os_string().to_owned());
-            // second is the program name
-            new_args.push(program.as_ref().to_owned());
-            new_args.extend(args.map(|item| item.as_ref().to_owned()));
-            trace!("[{}] Running cgexec-rs with args {:?}", pid, new_args);
-            command.args(new_args);
+            let mut command = Command::new(program);
+            command.args(args);
+            let child_cgroup_path = child_cgroup.as_path().to_owned();
+            unsafe {
+                command.pre_exec(move || {
+                    // in child process after fork, use blocking APIs
+                    let cgroup_procs_path = child_cgroup_path.join("cgroup.procs");
+                    let mut cgroup_procs = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&cgroup_procs_path)?;
+
+                    std::io::Seek::seek(&mut cgroup_procs, std::io::SeekFrom::End(0))?;
+                    std::io::Write::write(
+                        &mut cgroup_procs,
+                        format!("{}\n", std::process::id()).as_bytes(),
+                    )?;
+                    std::io::Write::flush(&mut cgroup_procs)?;
+                    Ok(())
+                });
+            }
             Ok((command, child_cgroup))
         }
     }

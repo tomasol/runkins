@@ -73,7 +73,7 @@ enum ActorEvent<OUTPUT> {
     ProcessFinished(std::io::Result<ExitStatus>),      // internal to main_actor
     StatusRequest(oneshot::Sender<RunningState>),      // sent by API call
     KillRequest(oneshot::Sender<std::io::Result<()>>), // sent by API call
-    StreamFinished(StdStream),                         // sent by std_forwarder tasks
+    StdStreamFinished(StdStream),                      // sent by std_forwarder tasks
     GetCurrentChunks(oneshot::Sender<Vec<Chunk>>),     // sent by API call
 }
 
@@ -242,11 +242,14 @@ where
             }
         }
         if tx
-            .send(ActorEvent::StreamFinished(std_stream))
+            .send(ActorEvent::StdStreamFinished(std_stream))
             .await
             .is_err()
         {
-            warn!("[{}] std_forwarder was unable to send StreamFinished", pid);
+            warn!(
+                "[{}] std_forwarder was unable to send StdStreamFinished",
+                pid
+            );
         }
     }
 
@@ -303,7 +306,7 @@ where
                 ActorEvent::ChunkAdded(chunk) => {
                     assert!(
                             stream_finished_event_count < 2,
-                            "[{}] main_actor in illegal state - ChunkAdded after receiving both StreamFinished events",
+                            "[{}] main_actor in illegal state - ChunkAdded after receiving both StdStreamFinished events",
                             pid
                         );
                     // notify all clients, removing disconnected
@@ -351,11 +354,11 @@ where
                         debug!("[{}] main_actor cannot reply to KillRequest", pid);
                     }
                 }
-                ActorEvent::StreamFinished(_) => {
+                ActorEvent::StdStreamFinished(_) => {
                     stream_finished_event_count += 1;
                     assert!(
                         stream_finished_event_count <= 2,
-                        "[{}] Illegal StreamFinished count",
+                        "[{}] Illegal StdStreamFinished count",
                         pid
                     );
                     if stream_finished_event_count == 2 {
@@ -402,22 +405,23 @@ where
         Ok(())
     }
 
-    pub fn new<STR, ITER>(
+    pub fn new<STR, STR2, ITER>(
         pid: Pid,
         process_path: STR,
         process_args: ITER,
         chunk_to_output: fn(Chunk) -> OUTPUT,
     ) -> Result<Self, ChildInfoCreationError>
     where
-        ITER: IntoIterator<Item = STR>,
+        ITER: IntoIterator<Item = STR2>,
         STR: AsRef<OsStr>,
+        STR2: AsRef<OsStr>,
     {
         let mut command = Command::new(&process_path);
         command.args(process_args);
         Self::new_internal(pid, command, chunk_to_output, &process_path, None)
     }
 
-    pub async fn new_with_cgroup<STR, ITER>(
+    pub async fn new_with_cgroup<STR, STR2, ITER>(
         pid: Pid,
         process_path: STR,
         process_args: ITER,
@@ -426,8 +430,9 @@ where
         limits: CGroupLimits,
     ) -> Result<Self, ChildInfoCreationWithCGroupError>
     where
-        ITER: ExactSizeIterator<Item = STR>,
+        ITER: ExactSizeIterator<Item = STR2>,
         STR: AsRef<OsStr>,
+        STR2: AsRef<OsStr>,
     {
         // construct command based on path and args
         let (command, child_cgroup) = CGroupCommandFactory::create_command(
@@ -565,24 +570,22 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
     use crate::cgroup::server_config::{CGroupConfig, CGroupConfigBuilder};
     use anyhow::{anyhow, bail, Context};
     use envconfig::Envconfig;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
 
     #[derive(Debug, Envconfig)]
     struct EnvVarConfiguration {
-        #[envconfig(from = "CGEXEC_RS")]
-        cgexec_rs: Option<String>,
         #[envconfig(from = "CGROUP_MOUNT_POINT", default = "/sys/fs/cgroup")]
         cgroup_mount_point: String,
         #[envconfig(from = "PARENT_CGROUP")]
         parent_cgroup: Option<String>,
         #[envconfig(from = "CGROUP_BLOCK_DEVICE_ID", default = "8:0")]
         block_device_id: String,
-        #[envconfig(from = "SLICE_NAME", default = "my.slice")]
+        #[envconfig(from = "SLICE_NAME", default = "jobexecutor_testing.slice")]
         slice_name: String,
     }
 
@@ -596,7 +599,6 @@ mod tests {
 
     #[derive(Debug)]
     struct DetectedCgroupConfiguration {
-        cgexec_rs: PathBuf,
         parent_cgroup: String,
         block_device_id: String,
     }
@@ -612,7 +614,6 @@ mod tests {
                         .await?
                 }
             };
-            let cgexec_rs = DetectedCgroupConfiguration::find_cgexec_rs(conf.cgexec_rs.as_ref())?;
             if !parent_cgroup.starts_with(&conf.cgroup_mount_point) {
                 bail!(
                     "parent_cgroup {} does not start with {}",
@@ -622,25 +623,11 @@ mod tests {
             }
 
             let conf = DetectedCgroupConfiguration {
-                cgexec_rs,
                 parent_cgroup,
                 block_device_id: conf.block_device_id.clone(),
             };
             debug!("Detected: {:?}", conf);
             Ok(conf)
-        }
-
-        fn find_cgexec_rs(cgexec_rs: Option<&String>) -> Result<PathBuf, anyhow::Error> {
-            Ok(if let Some(path) = cgexec_rs {
-                path.into()
-            } else {
-                trace!("Guessing cgexec-rs location based on current_exe");
-                let exe = std::env::current_exe()?;
-                exe.parent()
-                    .ok_or(anyhow!("Cannot "))?
-                    .join("..")
-                    .join("cgexec-rs")
-            })
         }
 
         async fn find_parent_cgroup_using_systemd_slice(
@@ -674,7 +661,6 @@ mod tests {
         fn into(self) -> CGroupConfigBuilder {
             CGroupConfigBuilder {
                 parent_cgroup: self.parent_cgroup.into(),
-                cgexec_rs: self.cgexec_rs,
                 move_current_pid_to_subfolder: false,
                 cgroup_block_device_id: self.block_device_id,
             }
@@ -686,10 +672,10 @@ mod tests {
         debug!("/proc/self/cgroup: {}", stdout);
         assert!(
             stdout.starts_with(EXPECTED_PROC_SELF_CGROUP_PREFIX),
-            "Unexpected prefix: {}",
+            "Unexpected prefix: `{}`",
             stdout
         );
-        assert!(stdout.ends_with("\n"), "Unexpected suffix: {}", stdout);
+        assert!(stdout.ends_with("\n"), "Unexpected suffix: `{}`", stdout);
         &stdout[EXPECTED_PROC_SELF_CGROUP_PREFIX.len()..stdout.len() - 1]
     }
 
@@ -712,6 +698,25 @@ mod tests {
         assert_eq!(parse_proc_self_cgroup("0::/bar/baz\n"), "bar/baz");
     }
 
+    async fn read_stdout<OUTPUT: 'static + std::fmt::Debug + Send>(
+        child_info: ChildInfo<OUTPUT>,
+    ) -> Result<String, anyhow::Error> {
+        let (exit_status, chunks) = child_info.output().await?;
+        assert!(
+            exit_status.success(),
+            "Running child process was not successful - {}",
+            exit_status
+        );
+        let out_bytes: Vec<u8> = chunks
+            .iter()
+            .map(|ch| ch.std_out())
+            .flatten()
+            .cloned()
+            .collect();
+        Ok(String::from_utf8(out_bytes)?)
+    }
+
+    // TODO: extract to a health check
     #[cfg(test_systemd_run)]
     #[tokio::test]
     async fn test_cgroup() -> Result<(), anyhow::Error> {
@@ -721,42 +726,59 @@ mod tests {
         let conf = DetectedCgroupConfiguration::new(&env_conf).await?;
         let cgroup_config_builder: CGroupConfigBuilder = conf.into();
 
-        let expected_path = cgroup_config_builder
+        let expected_child_cgroup_path = cgroup_config_builder
             .parent_cgroup
             .as_path()
             .join(format!("{}", pid));
+        // try to rmdir in case last execution failed to clean it up
+        let _ = tokio::fs::remove_dir(&expected_child_cgroup_path).await;
+
         let cgroup_config = CGroupConfig::new(cgroup_config_builder).await?;
-        let limits = Default::default();
         // FIXME: refactor, remove chunk_to_output from API
         let chunk_to_output = |chunk: Chunk| -> String { format!("{:?}", chunk) };
-        let child_info = ChildInfo::new_with_cgroup(
-            pid,
-            "cat".to_string(),
-            vec!["/proc/self/cgroup".to_string()].into_iter(),
-            chunk_to_output,
-            &cgroup_config,
-            limits,
-        )
-        .await?;
-        let _clean = child_info.as_auto_clean();
-        let (exit_status, chunks) = child_info.output().await?;
-        debug!("Child process status: {}", exit_status);
-        assert!(
-            exit_status.success(),
-            "Running child process was not successful"
-        );
-        let out_bytes: Vec<u8> = chunks
-            .iter()
-            .map(|ch| ch.std_out())
-            .flatten()
-            .cloned()
-            .collect();
-        let stdout = String::from_utf8(out_bytes)?;
-        let parent_cgroup =
-            get_parent_cgroup_from_proc_self_cgroup(&stdout, &env_conf.cgroup_mount_point)?;
-        let child_path = parent_cgroup.join(format!("{}", pid));
 
-        assert_eq!(child_path, expected_path);
+        // cat /proc/self/cgroup
+        {
+            let child_info = ChildInfo::new_with_cgroup(
+                pid,
+                "cat",
+                ["/proc/self/cgroup"].iter(),
+                chunk_to_output,
+                &cgroup_config,
+                Default::default(),
+            )
+            .await?;
+            let _cleanup_child_folder = child_info.as_auto_clean();
+            let stdout = read_stdout(child_info).await?;
+            let parent_cgroup =
+                get_parent_cgroup_from_proc_self_cgroup(&stdout, &env_conf.cgroup_mount_point)?;
+            let child_path = parent_cgroup.join(format!("{}", pid));
+
+            assert_eq!(child_path, expected_child_cgroup_path);
+        }
+        // cat $expected_child_cgroup_path/cgroup.controllers
+        // check that cgroup.controllers contains all of [cpu, memory, io]
+        {
+            let cgroup_controllers = expected_child_cgroup_path.join("cgroup.controllers");
+            let child_info = ChildInfo::new_with_cgroup(
+                pid,
+                "cat",
+                [cgroup_controllers].iter(),
+                chunk_to_output,
+                &cgroup_config,
+                Default::default(),
+            )
+            .await?;
+            let _cleanup_child_folder = child_info.as_auto_clean();
+            let stdout = read_stdout(child_info).await?;
+            let caps: HashSet<&str> = stdout.split(' ').filter(|x| !x.is_empty()).collect();
+            debug!("Available controllers: `{}`", stdout);
+            assert!(
+                caps.contains("cpu") && caps.contains("io") && caps.contains("memory"),
+                "Some required controllers not found: {:?}",
+                caps
+            );
+        }
         Ok(())
     }
 }

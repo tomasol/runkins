@@ -1,17 +1,8 @@
-# cgexec-rs
-Switches to the target cgroup and `exec`s the supplied command.
-Based on libcgroup's cgexec.
+# cgroup integration
 
-This document assumes that the unified cgroup hierarchy is mouted at `/sys/fs/cgroup`.
+This document assumes that the cgroup v2 hierarchy is mouted at `/sys/fs/cgroup`.
 
-## Usage
-```sh
-cgexec absolute-path-to-target-cgroup command <args>
-```
-
-## Running
-The binary can be run either using `cargo run --bin cgexec-bin` or
-executing the binary in `target` folder if it was already built by cargo.
+TODO: mention systemd folder
 
 ### Setting up cgroup v2 with systemd-run
 Systemd only allows managing following controllers by non-root users: `memory pids`.
@@ -63,8 +54,8 @@ If some are missing, add them:
 $ echo '+cpu +memory +io' > cgroup.subtree_control
 $ cat cgroup.subtree_control
 cpu io memory
-
 ```
+
 Finally add a target cgroup folder.
 ```sh
 $ mkdir $TARGET_CGROUP

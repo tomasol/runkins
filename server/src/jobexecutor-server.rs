@@ -261,14 +261,6 @@ impl JobExecutor for MyJobExecutor {
 }
 
 async fn guess_cgroup_config() -> Option<Result<CGroupConfig, CGroupConfigError>> {
-    let cgexec_rs = if let Ok(path) = std::env::var("CGEXEC_RS") {
-        path.into()
-    } else {
-        trace!("Guessing cgexec-rs location based on current_exe");
-        let exe = std::env::current_exe().ok()?;
-        exe.parent()?.join("cgexec-rs")
-    };
-    trace!("Using cgexec-rs {:?}", cgexec_rs);
     // when running as systemd service, this could be guessed using
     // cgroup2 mount point + /proc/self/cgroup
     let parent_cgroup = std::env::var("PARENT_CGROUP")
@@ -286,7 +278,6 @@ async fn guess_cgroup_config() -> Option<Result<CGroupConfig, CGroupConfigError>
         std::env::var("CGROUP_MOVE_CURRENT_PID_TO_SUBFOLDER_ENABLED").is_ok();
     Some(
         CGroupConfig::new(CGroupConfigBuilder {
-            cgexec_rs,
             parent_cgroup,
             cgroup_block_device_id,
             move_current_pid_to_subfolder,
@@ -344,7 +335,7 @@ pub mod tests {
     pub fn test_cannot_run_process() {
         let chunk_to_output = |chunk: Chunk| -> String { format!("{:?}", chunk) };
 
-        match ChildInfoGen::new(1, "", [], chunk_to_output) {
+        match ChildInfoGen::new(1, "", [] as [&str; 0], chunk_to_output) {
             Err(ChildInfoCreationError::CannotRunProcess(pid, _)) => {
                 assert_eq!(pid, 1);
             }
