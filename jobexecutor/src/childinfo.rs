@@ -165,15 +165,6 @@ pub enum CompleteExitStatus {
     Unknown(String),
 }
 
-impl CompleteExitStatus {
-    fn is_success(&self) -> bool {
-        match self {
-            CompleteExitStatus::Complete(status) => status.success(),
-            _ => false,
-        }
-    }
-}
-
 impl From<std::io::Result<ExitStatus>> for CompleteExitStatus {
     fn from(src: std::io::Result<ExitStatus>) -> Self {
         match src {
@@ -609,126 +600,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cgroup::server_config::{CGroupConfig, CGroupConfigBuilder};
-    use anyhow::{anyhow, bail, Context};
-    use envconfig::Envconfig;
-    use std::collections::HashSet;
-    use std::path::PathBuf;
-
-    #[derive(Debug, Envconfig)]
-    struct EnvVarConfiguration {
-        #[envconfig(from = "CGROUP_MOUNT_POINT", default = "/sys/fs/cgroup")]
-        cgroup_mount_point: String,
-        #[envconfig(from = "PARENT_CGROUP")]
-        parent_cgroup: Option<String>,
-        #[envconfig(from = "CGROUP_BLOCK_DEVICE_ID", default = "8:0")]
-        block_device_id: String,
-        #[envconfig(from = "SLICE_NAME", default = "jobexecutor_testing.slice")]
-        slice_name: String,
-    }
-
-    impl EnvVarConfiguration {
-        fn new() -> Result<EnvVarConfiguration, anyhow::Error> {
-            let conf = Self::init_from_env();
-            debug!("From env.vars: {:?}", conf);
-            Ok(conf?)
-        }
-    }
-
-    #[derive(Debug)]
-    struct DetectedCgroupConfiguration {
-        parent_cgroup: String,
-        block_device_id: String,
-    }
-
-    impl DetectedCgroupConfiguration {
-        async fn new(
-            conf: &EnvVarConfiguration,
-        ) -> Result<DetectedCgroupConfiguration, anyhow::Error> {
-            let parent_cgroup = match &conf.parent_cgroup {
-                Some(parent_cgroup) => parent_cgroup.clone(),
-                None => {
-                    DetectedCgroupConfiguration::find_parent_cgroup_using_systemd_slice(&conf)
-                        .await?
-                }
-            };
-            if !parent_cgroup.starts_with(&conf.cgroup_mount_point) {
-                bail!(
-                    "parent_cgroup {} does not start with {}",
-                    parent_cgroup,
-                    conf.cgroup_mount_point
-                );
-            }
-
-            let conf = DetectedCgroupConfiguration {
-                parent_cgroup,
-                block_device_id: conf.block_device_id.clone(),
-            };
-            debug!("Detected: {:?}", conf);
-            Ok(conf)
-        }
-
-        async fn find_parent_cgroup_using_systemd_slice(
-            conf: &EnvVarConfiguration,
-        ) -> Result<String, anyhow::Error> {
-            let output = Command::new("systemd-run")
-                .args(&[
-                    "--user",
-                    "-p",
-                    "Delegate=yes",
-                    &format!("--slice={}", conf.slice_name),
-                    "-P",
-                    "--",
-                    "cat",
-                    "/proc/self/cgroup",
-                ])
-                .output()
-                .await?;
-
-            if !output.status.success() {
-                bail!("Running systemd-run failed");
-            }
-            let stdout = String::from_utf8(output.stdout)?;
-            let parent_cgroup =
-                get_parent_cgroup_from_proc_self_cgroup(&stdout, &conf.cgroup_mount_point)?;
-            Ok(parent_cgroup.to_string_lossy().to_string())
-        }
-    }
-
-    impl Into<CGroupConfigBuilder> for DetectedCgroupConfiguration {
-        fn into(self) -> CGroupConfigBuilder {
-            CGroupConfigBuilder {
-                parent_cgroup: self.parent_cgroup.into(),
-                move_current_pid_to_subfolder: false,
-                cgroup_block_device_id: self.block_device_id,
-            }
-        }
-    }
 
     const EXPECTED_PROC_SELF_CGROUP_PREFIX: &str = "0::/";
-    fn parse_proc_self_cgroup<'a>(stdout: &'a str) -> &'a str {
+    fn parse_proc_self_cgroup(stdout: &str) -> &str {
         debug!("/proc/self/cgroup: {}", stdout);
         assert!(
             stdout.starts_with(EXPECTED_PROC_SELF_CGROUP_PREFIX),
             "Unexpected prefix: `{}`",
             stdout
         );
-        assert!(stdout.ends_with("\n"), "Unexpected suffix: `{}`", stdout);
+        assert!(stdout.ends_with('\n'), "Unexpected suffix: `{}`", stdout);
         &stdout[EXPECTED_PROC_SELF_CGROUP_PREFIX.len()..stdout.len() - 1]
-    }
-
-    fn get_parent_cgroup_from_proc_self_cgroup(
-        stdout: &str,
-        cgroup_mount_point: &str,
-    ) -> Result<PathBuf, anyhow::Error> {
-        let parsed_subpath = PathBuf::from(parse_proc_self_cgroup(&stdout));
-        let parsed_subpath = parsed_subpath
-            .parent()
-            .ok_or(anyhow!("Cannot get parent {}", parsed_subpath.display()))?;
-        let abs_path = PathBuf::from(cgroup_mount_point).join(parsed_subpath);
-        abs_path
-            .canonicalize()
-            .with_context(|| format!("Cannot canonicaize {:?}", abs_path))
     }
 
     #[test]
@@ -736,87 +618,209 @@ mod tests {
         assert_eq!(parse_proc_self_cgroup("0::/bar/baz\n"), "bar/baz");
     }
 
-    async fn read_stdout<OUTPUT: 'static + std::fmt::Debug + Send>(
-        child_info: ChildInfo<OUTPUT>,
-    ) -> Result<String, anyhow::Error> {
-        let (exit_status, chunks) = child_info.output().await?;
-        assert!(
-            exit_status.is_success(),
-            "Running child process was not successful - {:?}",
-            exit_status
-        );
-        let out_bytes: Vec<u8> = chunks
-            .iter()
-            .map(|ch| ch.std_out())
-            .flatten()
-            .cloned()
-            .collect();
-        Ok(String::from_utf8(out_bytes)?)
-    }
-
-    // TODO: extract to a health check
     #[cfg(test_systemd_run)]
-    #[tokio::test]
-    async fn test_cgroup() -> Result<(), anyhow::Error> {
-        env_logger::init();
-        let pid = 1;
-        let env_conf = EnvVarConfiguration::new()?;
-        let conf = DetectedCgroupConfiguration::new(&env_conf).await?;
-        let cgroup_config_builder: CGroupConfigBuilder = conf.into();
+    mod systemd_run {
+        use super::*;
+        use crate::cgroup::server_config::{CGroupConfig, CGroupConfigBuilder};
+        use anyhow::{anyhow, bail, Context};
+        use envconfig::Envconfig;
+        use std::collections::HashSet;
+        use std::path::PathBuf;
 
-        let expected_child_cgroup_path = cgroup_config_builder
-            .parent_cgroup
-            .as_path()
-            .join(format!("{}", pid));
-        // try to rmdir in case last execution failed to clean it up
-        let _ = tokio::fs::remove_dir(&expected_child_cgroup_path).await;
-
-        let cgroup_config = CGroupConfig::new(cgroup_config_builder).await?;
-        // FIXME: refactor, remove chunk_to_output from API
-        let chunk_to_output = |chunk: Chunk| -> String { format!("{:?}", chunk) };
-
-        // cat /proc/self/cgroup
-        {
-            let child_info = ChildInfo::new_with_cgroup(
-                pid,
-                "cat",
-                ["/proc/self/cgroup"].iter(),
-                chunk_to_output,
-                &cgroup_config,
-                Default::default(),
-            )
-            .await?;
-            let _cleanup_child_folder = child_info.as_auto_clean();
-            let stdout = read_stdout(child_info).await?;
-            let parent_cgroup =
-                get_parent_cgroup_from_proc_self_cgroup(&stdout, &env_conf.cgroup_mount_point)?;
-            let child_path = parent_cgroup.join(format!("{}", pid));
-
-            assert_eq!(child_path, expected_child_cgroup_path);
+        impl CompleteExitStatus {
+            fn is_success(&self) -> bool {
+                match self {
+                    CompleteExitStatus::Complete(status) => status.success(),
+                    _ => false,
+                }
+            }
         }
-        // cat $expected_child_cgroup_path/cgroup.controllers
-        // check that cgroup.controllers contains all of [cpu, memory, io]
-        {
-            let cgroup_controllers = expected_child_cgroup_path.join("cgroup.controllers");
-            let child_info = ChildInfo::new_with_cgroup(
-                pid,
-                "cat",
-                [cgroup_controllers].iter(),
-                chunk_to_output,
-                &cgroup_config,
-                Default::default(),
-            )
-            .await?;
-            let _cleanup_child_folder = child_info.as_auto_clean();
-            let stdout = read_stdout(child_info).await?;
-            let caps: HashSet<&str> = stdout.split(' ').filter(|x| !x.is_empty()).collect();
-            debug!("Available controllers: `{}`", stdout);
+
+        #[derive(Debug, Envconfig)]
+        struct EnvVarConfiguration {
+            #[envconfig(from = "CGROUP_MOUNT_POINT", default = "/sys/fs/cgroup")]
+            cgroup_mount_point: String,
+            #[envconfig(from = "PARENT_CGROUP")]
+            parent_cgroup: Option<String>,
+            #[envconfig(from = "CGROUP_BLOCK_DEVICE_ID", default = "8:0")]
+            block_device_id: String,
+            #[envconfig(from = "SLICE_NAME", default = "jobexecutor_testing.slice")]
+            slice_name: String,
+        }
+
+        impl EnvVarConfiguration {
+            fn new() -> Result<EnvVarConfiguration, anyhow::Error> {
+                let conf = Self::init_from_env();
+                debug!("From env.vars: {:?}", conf);
+                Ok(conf?)
+            }
+        }
+
+        #[derive(Debug)]
+        struct DetectedCgroupConfiguration {
+            parent_cgroup: String,
+            block_device_id: String,
+        }
+
+        impl DetectedCgroupConfiguration {
+            async fn new(
+                conf: &EnvVarConfiguration,
+            ) -> Result<DetectedCgroupConfiguration, anyhow::Error> {
+                let parent_cgroup = match &conf.parent_cgroup {
+                    Some(parent_cgroup) => parent_cgroup.clone(),
+                    None => {
+                        DetectedCgroupConfiguration::find_parent_cgroup_using_systemd_slice(conf)
+                            .await?
+                    }
+                };
+                if !parent_cgroup.starts_with(&conf.cgroup_mount_point) {
+                    bail!(
+                        "parent_cgroup {} does not start with {}",
+                        parent_cgroup,
+                        conf.cgroup_mount_point
+                    );
+                }
+
+                let conf = DetectedCgroupConfiguration {
+                    parent_cgroup,
+                    block_device_id: conf.block_device_id.clone(),
+                };
+                debug!("Detected: {:?}", conf);
+                Ok(conf)
+            }
+
+            async fn find_parent_cgroup_using_systemd_slice(
+                conf: &EnvVarConfiguration,
+            ) -> Result<String, anyhow::Error> {
+                let output = Command::new("systemd-run")
+                    .args(&[
+                        "--user",
+                        "-p",
+                        "Delegate=yes",
+                        &format!("--slice={}", conf.slice_name),
+                        "-P",
+                        "--",
+                        "cat",
+                        "/proc/self/cgroup",
+                    ])
+                    .output()
+                    .await?;
+
+                if !output.status.success() {
+                    bail!("Running systemd-run failed");
+                }
+                let stdout = String::from_utf8(output.stdout)?;
+                let parent_cgroup =
+                    get_parent_cgroup_from_proc_self_cgroup(&stdout, &conf.cgroup_mount_point)?;
+                Ok(parent_cgroup.to_string_lossy().to_string())
+            }
+        }
+
+        impl From<DetectedCgroupConfiguration> for CGroupConfigBuilder {
+            fn from(conf: DetectedCgroupConfiguration) -> Self {
+                CGroupConfigBuilder {
+                    parent_cgroup: conf.parent_cgroup.into(),
+                    move_current_pid_to_subfolder: false,
+                    cgroup_block_device_id: conf.block_device_id,
+                }
+            }
+        }
+
+        fn get_parent_cgroup_from_proc_self_cgroup(
+            stdout: &str,
+            cgroup_mount_point: &str,
+        ) -> Result<PathBuf, anyhow::Error> {
+            let parsed_subpath = PathBuf::from(parse_proc_self_cgroup(stdout));
+            let parsed_subpath = parsed_subpath
+                .parent()
+                .ok_or_else(|| anyhow!("Cannot get parent {}", parsed_subpath.display()))?;
+            let abs_path = PathBuf::from(cgroup_mount_point).join(parsed_subpath);
+            abs_path
+                .canonicalize()
+                .with_context(|| format!("Cannot canonicaize {:?}", abs_path))
+        }
+
+        async fn read_stdout<OUTPUT: 'static + std::fmt::Debug + Send>(
+            child_info: ChildInfo<OUTPUT>,
+        ) -> Result<String, anyhow::Error> {
+            let (exit_status, chunks) = child_info.output().await?;
             assert!(
-                caps.contains("cpu") && caps.contains("io") && caps.contains("memory"),
-                "Some required controllers not found: {:?}",
-                caps
+                exit_status.is_success(),
+                "Running child process was not successful - {:?}",
+                exit_status
             );
+            let out_bytes: Vec<u8> = chunks
+                .iter()
+                .map(|ch| ch.std_out())
+                .flatten()
+                .cloned()
+                .collect();
+            Ok(String::from_utf8(out_bytes)?)
         }
-        Ok(())
+
+        // TODO: extract to a health check
+        #[tokio::test]
+        async fn test_cgroup() -> Result<(), anyhow::Error> {
+            env_logger::init();
+            let pid = 1;
+            let env_conf = EnvVarConfiguration::new()?;
+            let conf = DetectedCgroupConfiguration::new(&env_conf).await?;
+            let cgroup_config_builder: CGroupConfigBuilder = conf.into();
+
+            let expected_child_cgroup_path = cgroup_config_builder
+                .parent_cgroup
+                .as_path()
+                .join(format!("{}", pid));
+            // try to rmdir in case last execution failed to clean it up
+            let _ = tokio::fs::remove_dir(&expected_child_cgroup_path).await;
+
+            let cgroup_config = CGroupConfig::new(cgroup_config_builder).await?;
+            // FIXME: refactor, remove chunk_to_output from API
+            let chunk_to_output = |chunk: Chunk| -> String { format!("{:?}", chunk) };
+
+            // cat /proc/self/cgroup
+            {
+                let child_info = ChildInfo::new_with_cgroup(
+                    pid,
+                    "cat",
+                    ["/proc/self/cgroup"].iter(),
+                    chunk_to_output,
+                    &cgroup_config,
+                    Default::default(),
+                )
+                .await?;
+                let _cleanup_child_folder = child_info.as_auto_clean();
+                let stdout = read_stdout(child_info).await?;
+                let parent_cgroup =
+                    get_parent_cgroup_from_proc_self_cgroup(&stdout, &env_conf.cgroup_mount_point)?;
+                let child_path = parent_cgroup.join(format!("{}", pid));
+
+                assert_eq!(child_path, expected_child_cgroup_path);
+            }
+            // cat $expected_child_cgroup_path/cgroup.controllers
+            // check that cgroup.controllers contains all of [cpu, memory, io]
+            {
+                let cgroup_controllers = expected_child_cgroup_path.join("cgroup.controllers");
+                let child_info = ChildInfo::new_with_cgroup(
+                    pid,
+                    "cat",
+                    [cgroup_controllers].iter(),
+                    chunk_to_output,
+                    &cgroup_config,
+                    Default::default(),
+                )
+                .await?;
+                let _cleanup_child_folder = child_info.as_auto_clean();
+                let stdout = read_stdout(child_info).await?;
+                let caps: HashSet<&str> = stdout.split(' ').filter(|x| !x.is_empty()).collect();
+                debug!("Available controllers: `{}`", stdout);
+                assert!(
+                    caps.contains("cpu") && caps.contains("io") && caps.contains("memory"),
+                    "Some required controllers not found: {:?}",
+                    caps
+                );
+            }
+            Ok(())
+        }
     }
 }
