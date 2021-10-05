@@ -27,15 +27,28 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           args: --all --tests
-          env: 
-            RUSTFLAGS="--cfg tokio_unstable --cfg test_systemd_run"
-
-      - name: Run clippy manually without annotations
-        run: cargo clippy --tests --all-targets -- -D warnings
-        env:
-          RUSTFLAGS: "--cfg tokio_unstable --cfg test_systemd_run"
 
       - name: test
         uses: actions-rs/cargo@v1
         with:
           command: test
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v2
+
+      - name: Install stable toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Install cache
+        uses: Swatinem/rust-cache@v1
+
+      - name: Run clippy manually without annotations
+        run: cargo clippy --tests --all-targets -- -D warnings
+        env:
+          RUSTFLAGS: "--cfg tokio_unstable --cfg test_systemd_run"
