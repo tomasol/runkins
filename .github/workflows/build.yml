@@ -26,6 +26,14 @@ jobs:
         uses: actions-rs/clippy-check@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          args: --all --tests
+          env: 
+            RUSTFLAGS="--cfg tokio_unstable --cfg test_systemd_run"
+
+      - name: Run clippy manually without annotations
+        run: cargo clippy --tests --all-targets -- -D warnings
+        env:
+          RUSTFLAGS: "--cfg tokio_unstable --cfg test_systemd_run"
 
       - name: test
         uses: actions-rs/cargo@v1
