@@ -1,4 +1,4 @@
-use std::{env, thread, time::Duration};
+use std::{env, os::unix::prelude::AsRawFd, thread, time::Duration};
 
 /// Small binary that writes to stdout/stderr once per second.
 /// Accepts one numerical argument that specifies the max number of iterations.
@@ -20,8 +20,20 @@ fn main() {
     loop {
         if i % 2 == 0 {
             println!("{}", i);
+            if Some(i + 2) == max_iterations {
+                println!("closing stdout");
+                unsafe {
+                    libc::close(std::io::stdout().as_raw_fd());
+                }
+            }
         } else {
             eprintln!("{}", i);
+            if Some(i + 2) == max_iterations {
+                eprintln!("closing stderr");
+                unsafe {
+                    libc::close(std::io::stderr().as_raw_fd());
+                }
+            }
         }
         i += 1;
         if max_iterations == Some(i) {
