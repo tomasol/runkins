@@ -192,6 +192,28 @@ impl<OUTPUT> ChildInfo<OUTPUT>
 where
     OUTPUT: std::fmt::Debug + Send + 'static,
 {
+    async fn rpc<RESP>(
+        &self,
+        event_fn: fn(oneshot::Sender<RESP>) -> ActorEvent<OUTPUT>,
+    ) -> Result<RESP, ()> {
+        let (oneshot_tx, oneshot_rx) = oneshot::channel();
+        self.actor_tx
+            .send(event_fn(oneshot_tx))
+            .await
+            .map_err(|_| {
+                // recreate the event for logging
+                let (oneshot_tx, _) = oneshot::channel();
+                let event = event_fn(oneshot_tx);
+                error!("[{}] {:?} rpc failed to send request", self.pid, event);
+            })?;
+        oneshot_rx.await.map_err(|_| {
+            // recreate the event for logging
+            let (oneshot_tx, _) = oneshot::channel();
+            let event = event_fn(oneshot_tx);
+            error!("[{}] {:?} rpc failed to read response", self.pid, event);
+        })
+    }
+
     pub async fn add_client(&self, client_tx: ClientTx<OUTPUT>) -> Result<(), AddClientError> {
         self.actor_tx
             .send(ActorEvent::ClientAdded(client_tx))
@@ -203,40 +225,16 @@ where
     }
 
     pub async fn output(&self) -> Result<(CompleteExitStatus, Vec<Chunk>), OutputError> {
-        let (oneshot_tx, oneshot_rx) = oneshot::channel();
-        self.actor_tx
-            .send(ActorEvent::NotifyWhenProcessFinishes(oneshot_tx))
+        let status = self
+            .rpc(ActorEvent::NotifyWhenProcessFinishes)
             .await
-            .map_err(|_| {
-                error!("[{}] OutputError::MainActorFinished", self.pid);
-                OutputError::MainActorFinished
-            })?;
-        let status = oneshot_rx.await.map_err(|err| {
-            error!(
-                "[{}] output() failed to read response_rx: {}",
-                self.pid, err
-            );
-            OutputError::MainActorFinished
-        })?;
+            .map_err(|_| OutputError::MainActorFinished)?;
 
-        let (response_tx, response_rx) = oneshot::channel();
-        self.actor_tx
-            .send(ActorEvent::GetCurrentChunks(response_tx))
+        let chunks = self
+            .rpc(ActorEvent::GetCurrentChunks)
             .await
-            .map_err(|err| {
-                error!(
-                    "[{}] output() failed to send to actor_tx: {}",
-                    self.pid, err
-                );
-                OutputError::MainActorFinished
-            })?;
-        let chunks = response_rx.await.map_err(|err| {
-            error!(
-                "[{}] output() failed to read response_rx: {}",
-                self.pid, err
-            );
-            OutputError::MainActorFinished
-        })?;
+            .map_err(|_| OutputError::MainActorFinished)?;
+
         Ok((status, chunks))
     }
 
@@ -526,7 +524,6 @@ where
             ))?;
 
         let (tx, rx) = mpsc::channel(1);
-        // TODO benchmark against one giant select!
 
         spawn_named(&format!("[{}] main_actor", pid), async move {
             ChildInfo::main_actor(pid, rx, child, chunk_to_output).await;
@@ -551,43 +548,16 @@ where
     }
 
     pub async fn status(&self) -> Result<RunningState, StatusError> {
-        let (status_tx, status_rx) = oneshot::channel();
-        self.actor_tx
-            .send(ActorEvent::StatusRequest(status_tx))
+        self.rpc(ActorEvent::StatusRequest)
             .await
-            .map_err(|_| {
-                error!("[{}] Cannot send request to the main actor", self.pid);
-                StatusError::MainActorFinished
-            })?;
-        status_rx.await.map_err(|err| {
-            error!(
-                "[{}] Cannot receive response from the main actor - {}",
-                self.pid, err
-            );
-            StatusError::MainActorFinished
-        })
+            .map_err(|_| StatusError::MainActorFinished)
     }
 
     pub async fn kill(&self) -> Result<(), StopError> {
-        let (kill_tx, kill_rx) = oneshot::channel();
-        self.actor_tx
-            .send(ActorEvent::KillRequest(kill_tx))
+        self.rpc(ActorEvent::KillRequest)
             .await
-            .map_err(|_| {
-                error!("[{}] Cannot send request to the main actor", self.pid);
-                StopError::MainActorFinished
-            })?;
-        match kill_rx.await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(err)) => Err(StopError::CannotStopProcess(self.pid, err)),
-            Err(err) => {
-                error!(
-                    "[{}] Cannot receive response from the main actor - {}",
-                    self.pid, err
-                );
-                Err(StopError::MainActorFinished)
-            }
-        }
+            .map_err(|_| StopError::MainActorFinished)?
+            .map_err(|err| StopError::CannotStopProcess(self.pid, err))
     }
 
     pub async fn clean_up(&self) -> std::io::Result<()> {
