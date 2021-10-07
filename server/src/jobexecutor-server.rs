@@ -6,6 +6,7 @@ use jobexecutor::cgroup::server_config::CGroupConfigBuilder;
 use jobexecutor::cgroup::server_config::CGroupConfigError;
 use jobexecutor::childinfo::ChildInfo as ChildInfoGen;
 use jobexecutor::childinfo::Chunk;
+use jobexecutor::childinfo::FinishedState;
 use jobexecutor::childinfo::Pid;
 use jobexecutor::childinfo::RunningState;
 use log::*;
@@ -157,11 +158,11 @@ impl JobExecutor for MyJobExecutor {
         let mut exit_code = None;
         let status = match child_info.status().await? {
             RunningState::Running => Ok(job_executor::status_response::RunningStatus::Running),
-            RunningState::Finished(Some(code)) => {
+            RunningState::Finished(FinishedState::WithExitCode(code)) => {
                 exit_code = Some(code);
                 Ok(job_executor::status_response::RunningStatus::ExitedWithCode)
             }
-            RunningState::Finished(None) => {
+            RunningState::Finished(FinishedState::WithSignal) => {
                 Ok(job_executor::status_response::RunningStatus::ExitedWithSignal)
             }
             RunningState::Unknown(reason) => {

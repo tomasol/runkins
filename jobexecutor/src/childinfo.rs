@@ -119,7 +119,20 @@ pub enum RunningState {
     // CompleteExitStatus + Running
     Running,
     Unknown(String),
-    Finished(Option<i32>),
+    Finished(FinishedState),
+}
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum FinishedState {
+    WithExitCode(i32),
+    WithSignal,
+}
+impl From<Option<i32>> for FinishedState {
+    fn from(maybe_code: Option<i32>) -> Self {
+        match maybe_code {
+            Some(code) => FinishedState::WithExitCode(code),
+            None => FinishedState::WithSignal,
+        }
+    }
 }
 
 impl RunningState {
@@ -157,14 +170,14 @@ where
 
 #[derive(Debug, Clone)]
 pub enum CompleteExitStatus {
-    Complete(Option<i32>),
+    Complete(FinishedState),
     Unknown(String),
 }
 
 impl From<std::io::Result<ExitStatus>> for CompleteExitStatus {
     fn from(src: std::io::Result<ExitStatus>) -> Self {
         match src {
-            Ok(status) => CompleteExitStatus::Complete(status.code()),
+            Ok(status) => CompleteExitStatus::Complete(status.code().into()),
             Err(err) => CompleteExitStatus::Unknown(err.to_string()),
         }
     }
@@ -624,7 +637,10 @@ mod tests {
 
         impl CompleteExitStatus {
             fn is_success(&self) -> bool {
-                matches!(self, CompleteExitStatus::Complete(Some(0)))
+                matches!(
+                    self,
+                    CompleteExitStatus::Complete(FinishedState::WithExitCode(0))
+                )
             }
         }
 
