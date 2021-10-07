@@ -17,7 +17,6 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
-use tokio::sync::oneshot::error::RecvError;
 
 #[derive(Error, Debug)]
 pub enum StopError {
@@ -25,8 +24,6 @@ pub enum StopError {
     CannotStopProcess(Pid, #[source] std::io::Error),
     #[error("main_actor is no longer running")] // TODO: panic instead?
     MainActorFinished,
-    #[error("main_actor failed to send the response")] // TODO: panic instead?
-    FailedToReceiveResponse(#[source] RecvError),
 }
 
 #[derive(Error, Debug)]
@@ -37,8 +34,6 @@ pub enum AddClientError {
 
 #[derive(Error, Debug)]
 pub enum StatusError {
-    #[error("[{0}] cannot get the child process status")]
-    UnknownProcessStatus(Pid),
     #[error("main_actor is no longer running")] // TODO: panic instead?
     MainActorFinished,
 }
@@ -120,10 +115,11 @@ impl Chunk {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-enum RunningState {
+pub enum RunningState {
+    // CompleteExitStatus + Running
     Running,
-    WaitFailed, // TODO rename to Unknown
-    Finished(ExitStatus),
+    Unknown(String),
+    Finished(Option<i32>),
 }
 
 impl RunningState {
@@ -131,7 +127,7 @@ impl RunningState {
         match status_result {
             None => RunningState::Running,
             Some(CompleteExitStatus::Complete(exit_status)) => RunningState::Finished(*exit_status),
-            Some(CompleteExitStatus::Unknown(_)) => RunningState::WaitFailed,
+            Some(CompleteExitStatus::Unknown(reason)) => RunningState::Unknown(reason.clone()),
         }
     }
 }
@@ -161,14 +157,14 @@ where
 
 #[derive(Debug, Clone)]
 pub enum CompleteExitStatus {
-    Complete(ExitStatus),
+    Complete(Option<i32>),
     Unknown(String),
 }
 
 impl From<std::io::Result<ExitStatus>> for CompleteExitStatus {
     fn from(src: std::io::Result<ExitStatus>) -> Self {
         match src {
-            Ok(status) => CompleteExitStatus::Complete(status),
+            Ok(status) => CompleteExitStatus::Complete(status.code()),
             Err(err) => CompleteExitStatus::Unknown(err.to_string()),
         }
     }
@@ -199,7 +195,7 @@ where
             .send(ActorEvent::NotifyWhenProcessFinishes(oneshot_tx))
             .await
             .map_err(|_| {
-                error!("[{}] StatusError::MainActorFinished", self.pid);
+                error!("[{}] OutputError::MainActorFinished", self.pid);
                 OutputError::MainActorFinished
             })?;
         let status = oneshot_rx.await.map_err(|err| {
@@ -541,26 +537,22 @@ where
         })
     }
 
-    // If process is still running, return Ok(None)
-    // If the process finished, return Ok(Some(ExitStatus))
-    pub async fn status(&self) -> Result<Option<ExitStatus>, StatusError> {
-        // FIXME return Result<RunningState, StatusError>
+    pub async fn status(&self) -> Result<RunningState, StatusError> {
         let (status_tx, status_rx) = oneshot::channel();
         self.actor_tx
             .send(ActorEvent::StatusRequest(status_tx))
             .await
-            .map_err(|err| {
-                error!(
-                    "[{}] Cannot send StatusRequest to the main actor - {}",
-                    self.pid, err
-                );
+            .map_err(|_| {
+                error!("[{}] Cannot send request to the main actor", self.pid);
                 StatusError::MainActorFinished
             })?;
-        match status_rx.await {
-            Ok(RunningState::Running) => Ok(None),
-            Ok(RunningState::Finished(exit_status)) => Ok(Some(exit_status)),
-            _ => Err(StatusError::UnknownProcessStatus(self.pid)),
-        }
+        status_rx.await.map_err(|err| {
+            error!(
+                "[{}] Cannot receive response from the main actor - {}",
+                self.pid, err
+            );
+            StatusError::MainActorFinished
+        })
     }
 
     pub async fn kill(&self) -> Result<(), StopError> {
@@ -569,15 +561,18 @@ where
             .send(ActorEvent::KillRequest(kill_tx))
             .await
             .map_err(|_| {
-                error!("[{}] StopError::MainActorFinished", self.pid);
+                error!("[{}] Cannot send request to the main actor", self.pid);
                 StopError::MainActorFinished
             })?;
         match kill_rx.await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(err)) => Err(StopError::CannotStopProcess(self.pid, err)),
             Err(err) => {
-                error!("[{}] StopError::FailedToReceiveResponse", self.pid);
-                Err(StopError::FailedToReceiveResponse(err))
+                error!(
+                    "[{}] Cannot receive response from the main actor - {}",
+                    self.pid, err
+                );
+                Err(StopError::MainActorFinished)
             }
         }
     }
@@ -630,7 +625,7 @@ mod tests {
         impl CompleteExitStatus {
             fn is_success(&self) -> bool {
                 match self {
-                    CompleteExitStatus::Complete(status) => status.success(),
+                    CompleteExitStatus::Complete(Some(0)) => true,
                     _ => false,
                 }
             }
@@ -775,7 +770,6 @@ mod tests {
             let _ = tokio::fs::remove_dir(&expected_child_cgroup_path).await;
 
             let cgroup_config = CGroupConfig::new(cgroup_config_builder).await?;
-            // FIXME: refactor, remove chunk_to_output from API
             let chunk_to_output = |chunk: Chunk| -> String { format!("{:?}", chunk) };
 
             // cat /proc/self/cgroup

@@ -7,6 +7,7 @@ use jobexecutor::cgroup::server_config::CGroupConfigError;
 use jobexecutor::childinfo::ChildInfo as ChildInfoGen;
 use jobexecutor::childinfo::Chunk;
 use jobexecutor::childinfo::Pid;
+use jobexecutor::childinfo::RunningState;
 use log::*;
 use rand::prelude::*;
 use std::collections::HashMap;
@@ -155,15 +156,21 @@ impl JobExecutor for MyJobExecutor {
 
         let mut exit_code = None;
         let status = match child_info.status().await? {
-            None => status_response::RunningStatus::Running,
-            Some(exit_status) => match exit_status.code() {
-                Some(code) => {
-                    exit_code = Some(code);
-                    status_response::RunningStatus::ExitedWithCode
-                }
-                None => status_response::RunningStatus::ExitedWithSignal,
-            },
-        };
+            RunningState::Running => Ok(job_executor::status_response::RunningStatus::Running),
+            RunningState::Finished(Some(code)) => {
+                exit_code = Some(code);
+                Ok(job_executor::status_response::RunningStatus::ExitedWithCode)
+            }
+            RunningState::Finished(None) => {
+                Ok(job_executor::status_response::RunningStatus::ExitedWithSignal)
+            }
+            RunningState::Unknown(reason) => {
+                error!("[{}] Cannot get job status - {}", pid, reason);
+                Err(tonic::Status::internal(
+                    "Cannot get job status, not removing",
+                ))
+            }
+        }?;
         Ok(Response::new(job_executor::StatusResponse {
             status: status as i32,
             exit_code,
@@ -235,19 +242,24 @@ impl JobExecutor for MyJobExecutor {
 
         // Only allow removing finished processes
         match child_info.status().await {
-            Ok(Some(_)) => {
-                // clean up cgroup
+            Ok(RunningState::Finished(_)) => {
                 child_info.clean_up().await?;
                 let removed = child_storage.remove(&pid);
                 assert!(
                     removed.is_some(),
-                    "HashMap contais a job that cannot be removed" // this should never happen
+                    "HashMap contains a job that cannot be removed" // this should never happen
                 );
                 Ok(())
             }
-            Ok(None) => {
+            Ok(RunningState::Running) => {
                 // still running, fail
                 Err(tonic::Status::failed_precondition("Job is still running"))
+            }
+            Ok(RunningState::Unknown(reason)) => {
+                error!("[{}] Cannot get job status, not removing - {}", pid, reason);
+                Err(tonic::Status::internal(
+                    "Cannot get job status, not removing",
+                ))
             }
             Err(err) => {
                 error!("[{}] Cannot get job status, not removing - {}", pid, err);
