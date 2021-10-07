@@ -624,10 +624,7 @@ mod tests {
 
         impl CompleteExitStatus {
             fn is_success(&self) -> bool {
-                match self {
-                    CompleteExitStatus::Complete(Some(0)) => true,
-                    _ => false,
-                }
+                matches!(self, CompleteExitStatus::Complete(Some(0)))
             }
         }
 
