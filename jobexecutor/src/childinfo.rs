@@ -14,14 +14,11 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Child;
 use tokio::process::Command;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
 #[derive(Error, Debug)]
 pub enum StopError {
-    #[error("[{0}] cannot stop the child process")]
-    CannotStopProcess(Pid, #[source] std::io::Error),
     #[error("main_actor is no longer running")] // TODO: panic instead?
     MainActorFinished,
 }
@@ -67,19 +64,19 @@ pub type Pid = u64;
 
 #[derive(Debug)]
 enum ActorEvent<OUTPUT> {
-    ChunkAdded(Chunk),                                 // sent by std_forwarder
-    ClientAdded(ClientTx<OUTPUT>),                     // sent by API call
-    ProcessFinished(CompleteExitStatus),               // internal to main_actor
-    StatusRequest(oneshot::Sender<RunningState>),      // sent by API call
-    KillRequest(oneshot::Sender<std::io::Result<()>>), // sent by API call
-    GetCurrentChunks(oneshot::Sender<Vec<Chunk>>),     // sent by API call
+    ChunkAdded(Chunk),                                // sent by std_forwarder
+    ClientAdded(ClientTx<OUTPUT>),                    // sent by API call
+    ProcessFinished(CompleteExitStatus),              // sent by child_actor
+    StatusRequest(oneshot::Sender<RunningState>),     // sent by API call
+    KillRequest(oneshot::Sender<CompleteExitStatus>), // sent by API call
+    GetCurrentChunks(oneshot::Sender<Vec<Chunk>>),    // sent by API call
     NotifyWhenProcessFinishes(oneshot::Sender<CompleteExitStatus>), // sent by API call
 }
 
 #[derive(Debug)]
 pub struct ChildInfo<OUTPUT> {
     pid: Pid,
-    actor_tx: mpsc::Sender<ActorEvent<OUTPUT>>,
+    main_tx: mpsc::Sender<ActorEvent<OUTPUT>>,
     child_cgroup: Option<ChildCGroup>,
 }
 
@@ -135,16 +132,6 @@ impl From<Option<i32>> for FinishedState {
     }
 }
 
-impl RunningState {
-    fn new(status_result: &Option<CompleteExitStatus>) -> RunningState {
-        match status_result {
-            None => RunningState::Running,
-            Some(CompleteExitStatus::Complete(exit_status)) => RunningState::Finished(*exit_status),
-            Some(CompleteExitStatus::Unknown(reason)) => RunningState::Unknown(reason.clone()),
-        }
-    }
-}
-
 #[derive(Debug)]
 pub enum StdStream {
     StdOut,
@@ -183,6 +170,32 @@ impl From<std::io::Result<ExitStatus>> for CompleteExitStatus {
     }
 }
 
+#[derive(Debug)]
+enum ExitStatusOrListeners<OUTPUT> {
+    ExitStatus(CompleteExitStatus),
+    Listeners {
+        exit_listeners: Vec<oneshot::Sender<CompleteExitStatus>>,
+        clients: Vec<ClientTx<OUTPUT>>,
+    },
+}
+
+impl<OUTPUT> ExitStatusOrListeners<OUTPUT> {
+    fn as_running_state(&self) -> RunningState {
+        match self {
+            ExitStatusOrListeners::Listeners {
+                exit_listeners: _,
+                clients: _,
+            } => RunningState::Running,
+            ExitStatusOrListeners::ExitStatus(CompleteExitStatus::Complete(exit_status)) => {
+                RunningState::Finished(*exit_status)
+            }
+            ExitStatusOrListeners::ExitStatus(CompleteExitStatus::Unknown(reason)) => {
+                RunningState::Unknown(reason.clone())
+            }
+        }
+    }
+}
+
 /// ChildInfo represents the started process, its state, output and all associated data.
 /// It starts several async tasks to keep track of the output and running status.
 /// Note about generic types:
@@ -197,15 +210,12 @@ where
         event_fn: fn(oneshot::Sender<RESP>) -> ActorEvent<OUTPUT>,
     ) -> Result<RESP, ()> {
         let (oneshot_tx, oneshot_rx) = oneshot::channel();
-        self.actor_tx
-            .send(event_fn(oneshot_tx))
-            .await
-            .map_err(|_| {
-                // recreate the event for logging
-                let (oneshot_tx, _) = oneshot::channel();
-                let event = event_fn(oneshot_tx);
-                error!("[{}] {:?} rpc failed to send request", self.pid, event);
-            })?;
+        self.main_tx.send(event_fn(oneshot_tx)).await.map_err(|_| {
+            // recreate the event for logging
+            let (oneshot_tx, _) = oneshot::channel();
+            let event = event_fn(oneshot_tx);
+            error!("[{}] {:?} rpc failed to send request", self.pid, event);
+        })?;
         oneshot_rx.await.map_err(|_| {
             // recreate the event for logging
             let (oneshot_tx, _) = oneshot::channel();
@@ -215,7 +225,7 @@ where
     }
 
     pub async fn add_client(&self, client_tx: ClientTx<OUTPUT>) -> Result<(), AddClientError> {
-        self.actor_tx
+        self.main_tx
             .send(ActorEvent::ClientAdded(client_tx))
             .await
             .map_err(|err| {
@@ -284,38 +294,54 @@ where
         }
     }
 
+    async fn child_actor(
+        pid: Pid,
+        mut child: Child,
+        child_actor_rx: oneshot::Receiver<()>,
+        main_tx: mpsc::Sender<ActorEvent<OUTPUT>>,
+    ) {
+        let status = tokio::select! {
+                new_status = child.wait() => {
+                    new_status
+                }
+                _ = child_actor_rx => {
+                    let _ = child.start_kill(); // ignore error when process is already killed
+                    child.wait().await
+                }
+        }
+        .into();
+        let send_result = main_tx.send(ActorEvent::ProcessFinished(status)).await;
+        if let Err(err) = send_result {
+            debug!(
+                "[{}] child_actor cannot send event {:?} to main_actor",
+                pid, err.0
+            );
+        }
+    }
+
     async fn main_actor<F: Fn(Chunk) -> OUTPUT>(
         pid: Pid,
-        mut rx: Receiver<ActorEvent<OUTPUT>>,
-        mut child: Child,
+        mut rx: mpsc::Receiver<ActorEvent<OUTPUT>>,
+        child_actor_tx: oneshot::Sender<()>,
         chunk_to_output: F,
     ) {
-        debug!("[{}] actor started", pid);
-        let mut chunks: Vec<Chunk> = vec![];
-        let mut clients: Vec<ClientTx<OUTPUT>> = vec![];
-        let mut exit_status = None;
-        let mut exit_listeners: Vec<oneshot::Sender<CompleteExitStatus>> = vec![];
-
         fn send_back<T>(tx: oneshot::Sender<T>, reply: T, pid: Pid, event: &str) {
             let send_result = tx.send(reply);
             if send_result.is_err() {
                 debug!("[{}] main_actor cannot respond to {}", pid, event);
             }
         }
+        debug!("[{}] actor started", pid);
+        let mut child_actor_tx = Some(child_actor_tx);
+        let mut chunks: Vec<Chunk> = vec![];
+
+        let mut status = ExitStatusOrListeners::Listeners {
+            exit_listeners: vec![],
+            clients: vec![],
+        };
 
         loop {
             let event = tokio::select! {
-                new_status = child.wait(), if exit_status.is_none() => {
-                    if new_status.is_ok() {
-                        debug!("[{}] main_actor finished waiting for child process: {:?}", pid, new_status);
-                    } else {
-                        warn!(
-                            "[{}] main_actor failed waiting for child process - {:?}",
-                            pid, new_status
-                        );
-                    }
-                    ActorEvent::ProcessFinished(new_status.into())
-                },
                 Some(event) = rx.recv() => {
                     event
                 },
@@ -325,79 +351,117 @@ where
                 }
             };
             trace!(
-                "[{}] main_actor event={:?}, chunks={}, clients={}, exit_status={:?}",
+                "[{}] main_actor event={:?}, chunks={}, status={:?}",
                 pid,
                 event,
                 chunks.len(),
-                clients.len(),
-                exit_status,
+                status,
             );
             // FIXME: cleanup resources when panicing in main_actor
             match event {
                 ActorEvent::ProcessFinished(new_status) => {
-                    exit_listeners.drain(..).for_each(|listener| {
-                        send_back(
-                            listener,
-                            new_status.clone(),
-                            pid,
-                            "NotifyWhenProcessFinishes",
+                    info!(
+                        "[{}] main_actor finished waiting for child process: {:?}",
+                        pid, new_status
+                    );
+                    if let ExitStatusOrListeners::Listeners {
+                        exit_listeners,
+                        clients: _,
+                    } = &mut status
+                    {
+                        exit_listeners.drain(..).for_each(|listener| {
+                            send_back(
+                                listener,
+                                new_status.clone(),
+                                pid,
+                                "NotifyWhenProcessFinishes",
+                            );
+                        });
+                        // disconnect clients by dropping clients
+                    } else {
+                        error!(
+                            "[{}] main_actor got ProcessFinished with status {:?}",
+                            pid, status
                         );
-                    });
-                    // disconnect clients
-                    clients.clear();
+                    }
                     // update status
-                    exit_status = Some(new_status);
+                    status = ExitStatusOrListeners::ExitStatus(new_status);
                 }
                 ActorEvent::ChunkAdded(chunk) => {
                     // notify all clients, removing disconnected
-                    clients.retain(|client_tx| {
-                        ChildInfo::send_chunk(pid, client_tx, chunk.clone(), &chunk_to_output)
-                            .map_err(|_| {
-                                info!("[{}] main_actor removing client {:?}", pid, client_tx);
-                            })
-                            .is_ok()
-                    });
-                    chunks.push(chunk);
-                    // memory improvement: detect when client closes the connection and drop the handle
+                    if let ExitStatusOrListeners::Listeners {
+                        exit_listeners: _,
+                        clients,
+                    } = &mut status
+                    {
+                        clients.retain(|client_tx| {
+                            ChildInfo::send_chunk(pid, client_tx, chunk.clone(), &chunk_to_output)
+                                .map_err(|_| {
+                                    info!("[{}] main_actor removing client {:?}", pid, client_tx);
+                                })
+                                .is_ok()
+                        });
+                        chunks.push(chunk);
+                    } else {
+                        error!(
+                            "[{}] main_actor got ChunkAdded with status {:?}",
+                            pid, status
+                        );
+                    }
                 }
                 ActorEvent::ClientAdded(client_tx) => {
                     let send_result =
                         ChildInfo::send_everything(pid, &client_tx, &chunks, &chunk_to_output);
+
                     if send_result.is_ok() {
-                        if exit_status.is_none() {
-                            // still running
+                        if let ExitStatusOrListeners::Listeners {
+                            exit_listeners: _,
+                            clients,
+                        } = &mut status
+                        {
                             clients.push(client_tx);
-                        } // otherwise drop client_tx which will disconnect the client
+                        }
                     } else {
                         info!(
                                 "[{}] main_actor not adding the client {:?}, error while replaying the output",
                                 pid, client_tx
                             );
-                        // TODO test that in this state the RPC disconnects the client
                     }
                 }
                 ActorEvent::GetCurrentChunks(response_tx) => {
                     send_back(response_tx, chunks.clone(), pid, "GetCurrentChunks");
                 }
                 ActorEvent::StatusRequest(status_tx) => {
-                    send_back(
-                        status_tx,
-                        RunningState::new(&exit_status),
-                        pid,
-                        "StatusRequest",
-                    );
+                    send_back(status_tx, status.as_running_state(), pid, "StatusRequest");
                 }
-                ActorEvent::KillRequest(kill_tx) => {
-                    send_back(kill_tx, child.kill().await, pid, "KillRequest");
-                }
-                ActorEvent::NotifyWhenProcessFinishes(listener) => {
-                    // either send the reply now or add to listeners
-                    match exit_status {
-                        None => {
+                ActorEvent::KillRequest(listener) => {
+                    if let Some(child_actor_tx) = child_actor_tx.take() {
+                        send_back(child_actor_tx, (), pid, "KillRequest");
+                    }
+                    // either send back the reply now or add to exit_listeners
+                    match &mut status {
+                        ExitStatusOrListeners::ExitStatus(ref status) => {
+                            send_back(listener, status.clone(), pid, "KillRequest");
+                        }
+                        ExitStatusOrListeners::Listeners {
+                            exit_listeners,
+                            clients: _,
+                        } => {
                             exit_listeners.push(listener);
                         }
-                        Some(ref status) => {
+                    }
+                }
+                ActorEvent::NotifyWhenProcessFinishes(listener) => {
+                    // either send back the reply now or add to exit_listeners
+                    match &mut status {
+                        ExitStatusOrListeners::ExitStatus(ref status) => {
                             send_back(listener, status.clone(), pid, "NotifyWhenProcessFinishes");
+                        }
+                        ExitStatusOrListeners::Listeners {
+                            exit_listeners,
+                            clients: _,
+                        } => {
+                            exit_listeners.push(listener);
                         }
                     }
                 }
@@ -523,26 +587,33 @@ where
                 StdStream::StdErr,
             ))?;
 
-        let (tx, rx) = mpsc::channel(1);
-
+        let (main_tx, main_rx) = mpsc::channel(1);
+        let (child_tx, child_rx) = oneshot::channel();
         spawn_named(&format!("[{}] main_actor", pid), async move {
-            ChildInfo::main_actor(pid, rx, child, chunk_to_output).await;
+            ChildInfo::main_actor(pid, main_rx, child_tx, chunk_to_output).await;
         });
+
         {
-            let tx = tx.clone();
-            spawn_named(&format!("[{}] stdout_forwarder", pid), async move {
-                ChildInfo::std_forwarder(pid, tx, stdout, StdStream::StdOut).await;
+            let main_tx = main_tx.clone();
+            spawn_named(&format!("[{}] child_actor", pid), async move {
+                ChildInfo::child_actor(pid, child, child_rx, main_tx).await;
             });
         }
         {
-            let tx = tx.clone();
+            let main_tx = main_tx.clone();
+            spawn_named(&format!("[{}] stdout_forwarder", pid), async move {
+                ChildInfo::std_forwarder(pid, main_tx, stdout, StdStream::StdOut).await;
+            });
+        }
+        {
+            let main_tx = main_tx.clone();
             spawn_named(&format!("[{}] stderr_forwarder", pid), async move {
-                ChildInfo::std_forwarder(pid, tx, stderr, StdStream::StdErr).await;
+                ChildInfo::std_forwarder(pid, main_tx, stderr, StdStream::StdErr).await;
             });
         }
         Ok(ChildInfo {
             pid,
-            actor_tx: tx,
+            main_tx,
             child_cgroup,
         })
     }
@@ -553,11 +624,10 @@ where
             .map_err(|_| StatusError::MainActorFinished)
     }
 
-    pub async fn kill(&self) -> Result<(), StopError> {
+    pub async fn kill(&self) -> Result<CompleteExitStatus, StopError> {
         self.rpc(ActorEvent::KillRequest)
             .await
-            .map_err(|_| StopError::MainActorFinished)?
-            .map_err(|err| StopError::CannotStopProcess(self.pid, err))
+            .map_err(|_| StopError::MainActorFinished)
     }
 
     pub async fn clean_up(&self) -> std::io::Result<()> {
