@@ -274,6 +274,7 @@ impl JobExecutor for MyJobExecutor {
     }
 }
 
+// TODO externalize env vars
 async fn guess_cgroup_config() -> Option<Result<CGroupConfig, CGroupConfigError>> {
     // when running as systemd service, this could be guessed using
     // cgroup2 mount point + /proc/self/cgroup

@@ -17,6 +17,8 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
+// TODO async fn with context
+
 #[derive(Error, Debug)]
 pub enum StopError {
     #[error("main_actor is no longer running")] // TODO: panic instead?
@@ -108,7 +110,7 @@ pub struct ChildInfo {
     child_cgroup: Option<ChildCGroup>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Chunk {
     StdOut(Vec<u8>),
     StdErr(Vec<u8>),
@@ -122,20 +124,20 @@ impl Chunk {
         }
     }
 
-    pub fn std_out(&self) -> &[u8] {
-        if let Chunk::StdOut(content) = self {
-            content
-        } else {
-            &[]
+    pub fn std_stream(&self, std_stream: StdStream) -> &[u8] {
+        match (std_stream, self) {
+            (StdStream::StdOut, Chunk::StdOut(content)) => content,
+            (StdStream::StdErr, Chunk::StdErr(content)) => content,
+            _ => &[],
         }
     }
 
+    pub fn std_out(&self) -> &[u8] {
+        self.std_stream(StdStream::StdOut)
+    }
+
     pub fn std_err(&self) -> &[u8] {
-        if let Chunk::StdErr(content) = self {
-            content
-        } else {
-            &[]
-        }
+        self.std_stream(StdStream::StdErr)
     }
 }
 
@@ -160,7 +162,7 @@ impl From<Option<i32>> for FinishedState {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum StdStream {
     StdOut,
     StdErr,
@@ -264,9 +266,15 @@ impl ChildInfo {
             })
     }
 
+    pub async fn wait_for_status(&self) -> Result<CompleteExitStatus, StatusError> {
+        self.rpc(ActorEvent::NotifyWhenProcessFinishes)
+            .await
+            .map_err(|_| StatusError::MainActorFinished)
+    }
+
     pub async fn output(&self) -> Result<(CompleteExitStatus, Vec<Chunk>), OutputError> {
         let status = self
-            .rpc(ActorEvent::NotifyWhenProcessFinishes)
+            .wait_for_status()
             .await
             .map_err(|_| OutputError::MainActorFinished)?;
 
@@ -645,6 +653,16 @@ impl ChildInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
+    impl CompleteExitStatus {
+        fn is_success(&self) -> bool {
+            matches!(
+                self,
+                CompleteExitStatus::Complete(FinishedState::WithExitCode(0))
+            )
+        }
+    }
 
     const EXPECTED_PROC_SELF_CGROUP_PREFIX: &str = "0::/";
     fn parse_proc_self_cgroup(stdout: &str) -> &str {
@@ -658,9 +676,90 @@ mod tests {
         &stdout[EXPECTED_PROC_SELF_CGROUP_PREFIX.len()..stdout.len() - 1]
     }
 
+    async fn read_std(
+        child_info: &ChildInfo,
+        std_stream: StdStream,
+    ) -> Result<String, anyhow::Error> {
+        let (exit_status, chunks) = child_info.output().await?;
+        assert!(
+            exit_status.is_success(),
+            "Running child process was not successful - {:?}",
+            exit_status
+        );
+        let out_bytes: Vec<u8> = chunks
+            .iter()
+            .map(|ch| ch.std_stream(std_stream))
+            .flatten()
+            .cloned()
+            .collect();
+        Ok(String::from_utf8(out_bytes)?)
+    }
+
     #[test]
     fn test_parse_proc_self_cgroup() {
         assert_eq!(parse_proc_self_cgroup("0::/bar/baz\n"), "bar/baz");
+    }
+
+    #[tokio::test]
+    async fn test_streaming() -> Result<(), anyhow::Error> {
+        env_logger::init();
+        let pid = 1;
+        let slow = std::env::current_exe()?
+            .parent()
+            .expect("p1 failed")
+            .parent()
+            .expect("p2 failed")
+            .join("slow");
+        assert!(slow.exists(), "{:?} does not exist", slow);
+
+        let child_info = ChildInfo::new(pid, slow, ["2"].iter())?;
+        let start = Instant::now();
+        debug!("Started at {:?}", start);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let client = ClientAndClosure::new(
+            "client_id".to_string(),
+            Box::new(move |chunk| {
+                let elapsed = start.elapsed();
+                debug!("Got {:?} after {:?}", chunk, elapsed);
+                tx.send((elapsed, chunk)).map_err(|_| ())
+            }),
+        );
+        child_info.add_client(client).await?;
+        let complete_exit_status = child_info.wait_for_status().await?;
+        assert!(complete_exit_status.is_success());
+        let expected_first_stdout = "0\nclosing stdout\n";
+        assert_eq!(
+            expected_first_stdout,
+            read_std(&child_info, StdStream::StdOut).await?,
+        );
+        let expected_second_stderr = "1\n";
+        assert_eq!(
+            read_std(&child_info, StdStream::StdErr).await?,
+            expected_second_stderr
+        );
+        // check timing
+        let (elapsed1, chunk) = rx.recv().await.expect("message not sent");
+        debug!("Got message {:?} after {:?}", chunk, elapsed1);
+        assert_eq!(
+            chunk,
+            Chunk::StdOut(expected_first_stdout.as_bytes().into())
+        );
+
+        let (elapsed2, chunk) = rx.recv().await.expect("message not sent");
+        debug!("Got message {:?} after {:?}", chunk, elapsed2);
+        assert_eq!(
+            chunk,
+            Chunk::StdErr(expected_second_stderr.as_bytes().into())
+        );
+        let dur = elapsed2 - elapsed1;
+        assert!(
+            dur.as_millis() >= 1000,
+            "Duration between chunk2 {:?} and chunk1 {:?} should be around 1s, was {:?}ms",
+            elapsed2,
+            elapsed1,
+            dur.as_millis()
+        );
+        Ok(())
     }
 
     #[cfg(test_systemd_run)]
@@ -671,15 +770,6 @@ mod tests {
         use envconfig::Envconfig;
         use std::collections::HashSet;
         use std::path::PathBuf;
-
-        impl CompleteExitStatus {
-            fn is_success(&self) -> bool {
-                matches!(
-                    self,
-                    CompleteExitStatus::Complete(FinishedState::WithExitCode(0))
-                )
-            }
-        }
 
         #[derive(Debug, Envconfig)]
         struct EnvVarConfiguration {
@@ -783,24 +873,6 @@ mod tests {
             abs_path
                 .canonicalize()
                 .with_context(|| format!("Cannot canonicaize {:?}", abs_path))
-        }
-
-        async fn read_stdout<OUTPUT: 'static + std::fmt::Debug + Send>(
-            child_info: ChildInfo<OUTPUT>,
-        ) -> Result<String, anyhow::Error> {
-            let (exit_status, chunks) = child_info.output().await?;
-            assert!(
-                exit_status.is_success(),
-                "Running child process was not successful - {:?}",
-                exit_status
-            );
-            let out_bytes: Vec<u8> = chunks
-                .iter()
-                .map(|ch| ch.std_out())
-                .flatten()
-                .cloned()
-                .collect();
-            Ok(String::from_utf8(out_bytes)?)
         }
 
         // TODO: extract to a health check
