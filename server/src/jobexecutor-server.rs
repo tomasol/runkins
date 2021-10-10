@@ -4,8 +4,9 @@ use jobexecutor::cgroup::concepts::CGroupLimits;
 use jobexecutor::cgroup::server_config::CGroupConfig;
 use jobexecutor::cgroup::server_config::CGroupConfigBuilder;
 use jobexecutor::cgroup::server_config::CGroupConfigError;
-use jobexecutor::childinfo::ChildInfo as ChildInfoGen;
+use jobexecutor::childinfo::ChildInfo;
 use jobexecutor::childinfo::Chunk;
+use jobexecutor::childinfo::ClientAndClosure;
 use jobexecutor::childinfo::FinishedState;
 use jobexecutor::childinfo::Pid;
 use jobexecutor::childinfo::RunningState;
@@ -20,8 +21,6 @@ use tonic::{transport::Server, Response};
 pub mod job_executor {
     tonic::include_proto!("jobexecutor");
 }
-
-type ChildInfo = ChildInfoGen<Result<OutputResponse, tonic::Status>>;
 
 #[derive(Debug)]
 pub struct MyJobExecutor {
@@ -84,17 +83,10 @@ impl MyJobExecutor {
     ) -> Result<ChildInfo, tonic::Status> {
         Ok(match (limits, &self.cgroup_config) {
             (Some(limits), Some(cgroup_config)) => {
-                ChildInfo::new_with_cgroup(
-                    pid,
-                    path,
-                    args.into_iter(),
-                    Self::chunk_to_output,
-                    cgroup_config,
-                    limits,
-                )
-                .await?
+                ChildInfo::new_with_cgroup(pid, path, args.into_iter(), cgroup_config, limits)
+                    .await?
             }
-            (None, _) => ChildInfo::new(pid, path, args, Self::chunk_to_output)?,
+            (None, _) => ChildInfo::new(pid, path, args)?,
             _ => {
                 // client requested limits but cgroup_config is not available
                 return Err(tonic::Status::invalid_argument(
@@ -219,7 +211,16 @@ impl JobExecutor for MyJobExecutor {
             .ok_or_else(|| tonic::Status::not_found("Cannot find job"))?;
 
         let (tx, rx) = mpsc::unbounded_channel();
-        child_info.add_client(tx).await?;
+        let client_and_closure = ClientAndClosure::new(
+            "client_id".to_string(),
+            Box::new(move |chunk| {
+                tx.send(MyJobExecutor::chunk_to_output(chunk)).map_err(|_| {
+                    info!("Client ? disconnected");
+                    ()
+                }) // TODO PID, IP
+            }),
+        );
+        child_info.add_client(client_and_closure).await?;
 
         Ok(Response::new(UnboundedReceiverStream::new(rx)))
     }
@@ -346,9 +347,7 @@ pub mod tests {
 
     #[test]
     pub fn test_cannot_run_process() {
-        let chunk_to_output = |chunk: Chunk| -> String { format!("{:?}", chunk) };
-
-        match ChildInfoGen::new(1, "", [] as [&str; 0], chunk_to_output) {
+        match ChildInfo::new(1, "", [] as [&str; 0]) {
             Err(ChildInfoCreationError::CannotRunProcess(pid, _)) => {
                 assert_eq!(pid, 1);
             }

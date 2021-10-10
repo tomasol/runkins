@@ -6,6 +6,7 @@ use crate::cgroup::server_config::CGroupConfig;
 use crate::cgroup::server_config::ChildCGroup;
 use log::*;
 use std::ffi::OsStr;
+use std::fmt::Display;
 use std::process::ExitStatus;
 use std::process::Stdio;
 use thiserror::Error;
@@ -14,7 +15,6 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Child;
 use tokio::process::Command;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
 #[derive(Error, Debug)]
@@ -58,14 +58,42 @@ pub enum ChildInfoCreationWithCGroupError {
 }
 
 /// Type of the writable part of a mpsc channel for streaming output chunks to a client.
-// TODO low: add Display trait for showing IP:port of the client
-type ClientTx<OUTPUT> = UnboundedSender<OUTPUT>;
 pub type Pid = u64;
+type ClientClosure = Box<dyn Fn(Chunk) -> Result<(), ()> + Send>; // TODO why Send?
+
+pub struct ClientAndClosure {
+    client_id: String,
+    closure: ClientClosure,
+}
+
+impl ClientAndClosure {
+    pub fn new(client_id: String, closure: ClientClosure) -> ClientAndClosure {
+        ClientAndClosure { client_id, closure }
+    }
+
+    fn call(&self, chunk: Chunk) -> Result<(), ()> {
+        (self.closure)(chunk)
+    }
+}
+
+impl std::fmt::Debug for ClientAndClosure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientAndClosure")
+            .field("client_id", &self.client_id)
+            .finish()
+    }
+}
+
+impl Display for ClientAndClosure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.client_id)
+    }
+}
 
 #[derive(Debug)]
-enum ActorEvent<OUTPUT> {
+enum ActorEvent {
     ChunkAdded(Chunk),                                // sent by std_forwarder
-    ClientAdded(ClientTx<OUTPUT>),                    // sent by API call
+    ClientAdded(ClientAndClosure),                    // sent by API call
     ProcessFinished(CompleteExitStatus),              // sent by child_actor
     StatusRequest(oneshot::Sender<RunningState>),     // sent by API call
     KillRequest(oneshot::Sender<CompleteExitStatus>), // sent by API call
@@ -74,9 +102,9 @@ enum ActorEvent<OUTPUT> {
 }
 
 #[derive(Debug)]
-pub struct ChildInfo<OUTPUT> {
+pub struct ChildInfo {
     pid: Pid,
-    main_tx: mpsc::Sender<ActorEvent<OUTPUT>>,
+    main_tx: mpsc::Sender<ActorEvent>,
     child_cgroup: Option<ChildCGroup>,
 }
 
@@ -170,16 +198,15 @@ impl From<std::io::Result<ExitStatus>> for CompleteExitStatus {
     }
 }
 
-#[derive(Debug)]
-enum ExitStatusOrListeners<OUTPUT> {
+enum ExitStatusOrListeners {
     ExitStatus(CompleteExitStatus),
     Listeners {
         exit_listeners: Vec<oneshot::Sender<CompleteExitStatus>>,
-        clients: Vec<ClientTx<OUTPUT>>,
+        clients: Vec<ClientAndClosure>,
     },
 }
 
-impl<OUTPUT> ExitStatusOrListeners<OUTPUT> {
+impl ExitStatusOrListeners {
     fn as_running_state(&self) -> RunningState {
         match self {
             ExitStatusOrListeners::Listeners {
@@ -196,18 +223,21 @@ impl<OUTPUT> ExitStatusOrListeners<OUTPUT> {
     }
 }
 
+impl Display for ExitStatusOrListeners {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("{:?}", self.as_running_state()))
+    }
+}
+
 /// ChildInfo represents the started process, its state, output and all associated data.
 /// It starts several async tasks to keep track of the output and running status.
 /// Note about generic types:
 /// OUTPUT is a type that represents the message written to a channel
 /// when streaming the output, see ClientTx type.
-impl<OUTPUT> ChildInfo<OUTPUT>
-where
-    OUTPUT: std::fmt::Debug + Send + 'static,
-{
+impl ChildInfo {
     async fn rpc<RESP>(
         &self,
-        event_fn: fn(oneshot::Sender<RESP>) -> ActorEvent<OUTPUT>,
+        event_fn: fn(oneshot::Sender<RESP>) -> ActorEvent,
     ) -> Result<RESP, ()> {
         let (oneshot_tx, oneshot_rx) = oneshot::channel();
         self.main_tx.send(event_fn(oneshot_tx)).await.map_err(|_| {
@@ -224,9 +254,9 @@ where
         })
     }
 
-    pub async fn add_client(&self, client_tx: ClientTx<OUTPUT>) -> Result<(), AddClientError> {
+    pub async fn add_client(&self, client: ClientAndClosure) -> Result<(), AddClientError> {
         self.main_tx
-            .send(ActorEvent::ClientAdded(client_tx))
+            .send(ActorEvent::ClientAdded(client))
             .await
             .map_err(|err| {
                 error!("[{}] Cannot add_client: {}", self.pid, err);
@@ -252,7 +282,7 @@ where
     // to the provided event sender of main_actor.
     async fn std_forwarder<T: AsyncRead + std::marker::Unpin>(
         pid: Pid,
-        tx: mpsc::Sender<ActorEvent<OUTPUT>>,
+        tx: mpsc::Sender<ActorEvent>,
         mut reader: T,
         std_stream: StdStream,
     ) {
@@ -298,7 +328,7 @@ where
         pid: Pid,
         mut child: Child,
         child_actor_rx: oneshot::Receiver<()>,
-        main_tx: mpsc::Sender<ActorEvent<OUTPUT>>,
+        main_tx: mpsc::Sender<ActorEvent>,
     ) {
         let status = tokio::select! {
                 new_status = child.wait() => {
@@ -319,11 +349,10 @@ where
         }
     }
 
-    async fn main_actor<F: Fn(Chunk) -> OUTPUT>(
+    async fn main_actor(
         pid: Pid,
-        mut rx: mpsc::Receiver<ActorEvent<OUTPUT>>,
+        mut rx: mpsc::Receiver<ActorEvent>,
         child_actor_tx: oneshot::Sender<()>,
-        chunk_to_output: F,
     ) {
         fn send_back<T>(tx: oneshot::Sender<T>, reply: T, pid: Pid, event: &str) {
             let send_result = tx.send(reply);
@@ -351,7 +380,7 @@ where
                 }
             };
             trace!(
-                "[{}] main_actor event={:?}, chunks={}, status={:?}",
+                "[{}] main_actor event={:?}, chunks={}, status={}",
                 pid,
                 event,
                 chunks.len(),
@@ -380,7 +409,7 @@ where
                         // disconnect clients by dropping clients
                     } else {
                         error!(
-                            "[{}] main_actor got ProcessFinished with status {:?}",
+                            "[{}] main_actor got ProcessFinished with status {}",
                             pid, status
                         );
                     }
@@ -394,24 +423,20 @@ where
                         clients,
                     } = &mut status
                     {
-                        clients.retain(|client_tx| {
-                            ChildInfo::send_chunk(pid, client_tx, chunk.clone(), &chunk_to_output)
+                        clients.retain(|client| {
+                            ChildInfo::send_chunk(pid, &client, chunk.clone())
                                 .map_err(|_| {
-                                    info!("[{}] main_actor removing client {:?}", pid, client_tx);
+                                    info!("[{}] main_actor removing client {}", pid, client);
                                 })
                                 .is_ok()
                         });
                         chunks.push(chunk);
                     } else {
-                        error!(
-                            "[{}] main_actor got ChunkAdded with status {:?}",
-                            pid, status
-                        );
+                        error!("[{}] main_actor got ChunkAdded with status {}", pid, status);
                     }
                 }
-                ActorEvent::ClientAdded(client_tx) => {
-                    let send_result =
-                        ChildInfo::send_everything(pid, &client_tx, &chunks, &chunk_to_output);
+                ActorEvent::ClientAdded(client) => {
+                    let send_result = ChildInfo::send_everything(pid, &client, &chunks);
 
                     if send_result.is_ok() {
                         if let ExitStatusOrListeners::Listeners {
@@ -419,12 +444,12 @@ where
                             clients,
                         } = &mut status
                         {
-                            clients.push(client_tx);
+                            clients.push(client);
                         }
                     } else {
                         info!(
-                                "[{}] main_actor not adding the client {:?}, error while replaying the output",
-                                pid, client_tx
+                                "[{}] main_actor not adding the client {}, error while replaying the output",
+                                pid, client
                             );
                     }
                 }
@@ -470,45 +495,22 @@ where
     }
 
     // send everything to this client. This might be a bottleneck if many clients start connecting.
-    fn send_everything<F: Fn(Chunk) -> OUTPUT>(
-        pid: Pid,
-        client_tx: &ClientTx<OUTPUT>,
-        chunks: &[Chunk],
-        chunk_to_output: &F,
-    ) -> Result<(), ()> {
+    fn send_everything(pid: Pid, client: &ClientAndClosure, chunks: &[Chunk]) -> Result<(), ()> {
         for chunk in chunks {
-            ChildInfo::send_chunk(pid, client_tx, chunk.clone(), chunk_to_output)?;
+            ChildInfo::send_chunk(pid, client, chunk.clone())?;
         }
         Ok(())
     }
 
-    fn send_chunk<F: Fn(Chunk) -> OUTPUT>(
-        pid: Pid,
-        client_tx: &ClientTx<OUTPUT>,
-        chunk: Chunk,
-        chunk_to_output: &F,
-    ) -> Result<(), ()> {
-        trace!(
-            "[{}] send_chunk chunk:{:?} client:{:?}",
-            pid,
-            chunk,
-            client_tx
-        );
-        let output_response = chunk_to_output(chunk);
-        client_tx.send(output_response).map_err(|err| {
-            warn!(
-                "[{}] Cannot send chunk to client {:?} - {}",
-                pid, client_tx, err
-            );
-        })?;
-        Ok(())
+    fn send_chunk(pid: Pid, client: &ClientAndClosure, chunk: Chunk) -> Result<(), ()> {
+        trace!("[{}] send_chunk chunk:{:?} client:{}", pid, chunk, client);
+        client.call(chunk)
     }
 
     pub fn new<STR, STR2, ITER>(
         pid: Pid,
         process_path: STR,
         process_args: ITER,
-        chunk_to_output: fn(Chunk) -> OUTPUT,
     ) -> Result<Self, ChildInfoCreationError>
     where
         ITER: IntoIterator<Item = STR2>,
@@ -517,14 +519,13 @@ where
     {
         let mut command = Command::new(&process_path);
         command.args(process_args);
-        Self::new_internal(pid, command, chunk_to_output, &process_path, None)
+        Self::new_internal(pid, command, &process_path, None)
     }
 
     pub async fn new_with_cgroup<STR, STR2, ITER>(
         pid: Pid,
         process_path: STR,
         process_args: ITER,
-        chunk_to_output: fn(Chunk) -> OUTPUT,
         cgroup_config: &CGroupConfig,
         limits: CGroupLimits,
     ) -> Result<Self, ChildInfoCreationWithCGroupError>
@@ -543,23 +544,19 @@ where
         )
         .await
         .map_err(|err| ChildInfoCreationWithCGroupError::ProcessExecutionError(pid, err))?;
-        Self::new_internal(
-            pid,
-            command,
-            chunk_to_output,
-            &process_path.as_ref(),
-            Some(child_cgroup),
-        )
-        .map_err(|err| ChildInfoCreationWithCGroupError::ChildInfoCreationError(pid, err))
+        Self::new_internal(pid, command, &process_path.as_ref(), Some(child_cgroup))
+            .map_err(|err| ChildInfoCreationWithCGroupError::ChildInfoCreationError(pid, err))
     }
 
-    fn new_internal<STR: AsRef<OsStr>>(
+    fn new_internal<STR>(
         pid: Pid,
         mut command: Command,
-        chunk_to_output: fn(Chunk) -> OUTPUT,
         process_path: STR,
         child_cgroup: Option<ChildCGroup>,
-    ) -> Result<Self, ChildInfoCreationError> {
+    ) -> Result<Self, ChildInfoCreationError>
+    where
+        STR: AsRef<OsStr>,
+    {
         // consider adding ability to control env.vars
         command
             .current_dir(".") // consider making this configurable
@@ -590,7 +587,7 @@ where
         let (main_tx, main_rx) = mpsc::channel(1);
         let (child_tx, child_rx) = oneshot::channel();
         spawn_named(&format!("[{}] main_actor", pid), async move {
-            ChildInfo::main_actor(pid, main_rx, child_tx, chunk_to_output).await;
+            ChildInfo::main_actor(pid, main_rx, child_tx).await;
         });
 
         {
