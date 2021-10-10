@@ -28,15 +28,6 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           args: --all --tests
 
-      - name: debug1
-        run: find .
-
-      - name: debug2
-        run: cargo build
-
-      - name: debug3
-        run: find .
-
       - name: test
         run: cargo test
         env:

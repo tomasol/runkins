@@ -717,9 +717,10 @@ mod tests {
         let pid = 1;
         let slow = std::env::current_exe()?
             .parent()
-            .expect("p1 failed")
+            .expect("removing test filename failed")
             .parent()
-            .expect("p2 failed")
+            .expect("removing test subfolder failed")
+            .join("examples")
             .join("slow");
         assert!(slow.exists(), "{:?} does not exist", slow);
 
@@ -764,7 +765,7 @@ mod tests {
         );
         let dur = elapsed2 - elapsed1;
         assert!(
-            dur.as_millis() >= 1000,
+            dur.as_millis() >= 900,
             "Duration between chunk2 {:?} and chunk1 {:?} should be around 1s, was {:?}ms",
             elapsed2,
             elapsed1,
