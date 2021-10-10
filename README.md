@@ -3,10 +3,9 @@
 Folder structure:
 * cgexec-rs - binary `cgexec-rs` - used by the server to switch cgroup
 * cli - binary `jobexecutor-cli` - CLI
-* jobexecutor - library used by the server
+* jobexecutor - library used by the server, `examples/slow` binary for testing
 * proto - `*.proto` definition
 * server - binary `jobexecutor-server` - gRPC server
-* testing - binary `slow` for testing
 * systemd - sample .service file
 
 ## Building
@@ -61,10 +60,10 @@ To get help with commands, use `--help` flag.
 ## Testing
 ### Manual testing
 Start the server, then execute the binary
-[slow](testing/src/slow.rs) created just for testing:
+[slow](jobexecutor/examples/slow.rs) created just for testing:
 ```sh
 EID=$(cargo run --bin jobexecutor-cli start -- \
- cargo run --bin slow 10)
+ cargo run --example slow 10)
 ```
 Test that the system works as expected. The `output` subcommand
 should write lines to stdout and stderr. After the program

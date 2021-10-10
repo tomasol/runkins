@@ -4,5 +4,4 @@ members = [
   "jobexecutor",
   "server",
   "cli",
-  "testing",
 ]

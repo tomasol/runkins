@@ -491,6 +491,7 @@ dependencies = [
  "anyhow",
  "env_logger",
  "envconfig",
+ "libc",
  "log",
  "rand",
  "thiserror",
@@ -530,13 +531,6 @@ dependencies = [
  "tonic",
  "tonic-build",
  "tracing-core",
-]
-
-[[package]]
-name = "jobexecutor-testing"
-version = "0.1.0"
-dependencies = [
- "libc",
 ]
 
 [[package]]
