@@ -440,6 +440,7 @@ impl ChildInfo {
                         });
                         chunks.push(chunk);
                     } else {
+                        // FIXME high: race between child_actor and std_forwarder
                         error!("[{}] main_actor got ChunkAdded with status {}", pid, status);
                     }
                 }

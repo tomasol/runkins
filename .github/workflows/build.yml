@@ -28,10 +28,20 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           args: --all --tests
 
+      - name: debug1
+        run: find .
+
+      - name: debug2
+        run: cargo build
+
+      - name: debug3
+        run: find .
+
       - name: test
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
+        run: cargo test
+        env:
+          RUST_LOG: debug
+          RUST_BACKTRACE: 1
 
   clippy:
     runs-on: ubuntu-latest
