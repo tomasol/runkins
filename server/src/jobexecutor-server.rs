@@ -216,7 +216,6 @@ impl JobExecutor for MyJobExecutor {
             Box::new(move |chunk| {
                 tx.send(MyJobExecutor::chunk_to_output(chunk)).map_err(|_| {
                     info!("Client ? disconnected");
-                    ()
                 }) // TODO PID, IP
             }),
         );

@@ -432,7 +432,7 @@ impl ChildInfo {
                     } = &mut status
                     {
                         clients.retain(|client| {
-                            ChildInfo::send_chunk(pid, &client, chunk.clone())
+                            ChildInfo::send_chunk(pid, client, chunk.clone())
                                 .map_err(|_| {
                                     info!("[{}] main_actor removing client {}", pid, client);
                                 })
@@ -695,6 +695,16 @@ mod tests {
         Ok(String::from_utf8(out_bytes)?)
     }
 
+    use std::sync::Once;
+
+    static INIT: Once = Once::new();
+
+    fn before_all() {
+        INIT.call_once(|| {
+            env_logger::init();
+        });
+    }
+
     #[test]
     fn test_parse_proc_self_cgroup() {
         assert_eq!(parse_proc_self_cgroup("0::/bar/baz\n"), "bar/baz");
@@ -702,7 +712,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_streaming() -> Result<(), anyhow::Error> {
-        env_logger::init();
+        before_all();
         let pid = 1;
         let slow = std::env::current_exe()?
             .parent()
@@ -878,7 +888,7 @@ mod tests {
         // TODO: extract to a health check
         #[tokio::test]
         async fn test_cgroup() -> Result<(), anyhow::Error> {
-            env_logger::init();
+            before_all();
             let pid = 1;
             let env_conf = EnvVarConfiguration::new()?;
             let conf = DetectedCgroupConfiguration::new(&env_conf).await?;
@@ -892,7 +902,6 @@ mod tests {
             let _ = tokio::fs::remove_dir(&expected_child_cgroup_path).await;
 
             let cgroup_config = CGroupConfig::new(cgroup_config_builder).await?;
-            let chunk_to_output = |chunk: Chunk| -> String { format!("{:?}", chunk) };
 
             // cat /proc/self/cgroup
             {
@@ -900,13 +909,12 @@ mod tests {
                     pid,
                     "cat",
                     ["/proc/self/cgroup"].iter(),
-                    chunk_to_output,
                     &cgroup_config,
                     Default::default(),
                 )
                 .await?;
                 let _cleanup_child_folder = child_info.as_auto_clean();
-                let stdout = read_stdout(child_info).await?;
+                let stdout = read_std(&child_info, StdStream::StdOut).await?;
                 let parent_cgroup =
                     get_parent_cgroup_from_proc_self_cgroup(&stdout, &env_conf.cgroup_mount_point)?;
                 let child_path = parent_cgroup.join(format!("{}", pid));
@@ -921,13 +929,12 @@ mod tests {
                     pid,
                     "cat",
                     [cgroup_controllers].iter(),
-                    chunk_to_output,
                     &cgroup_config,
                     Default::default(),
                 )
                 .await?;
                 let _cleanup_child_folder = child_info.as_auto_clean();
-                let stdout = read_stdout(child_info).await?;
+                let stdout = read_std(&child_info, StdStream::StdOut).await?;
                 let caps: HashSet<&str> = stdout.split(' ').filter(|x| !x.is_empty()).collect();
                 debug!("Available controllers: `{}`", stdout);
                 assert!(
