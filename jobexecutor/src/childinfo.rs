@@ -674,6 +674,7 @@ impl ChildInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
     use std::time::Instant;
 
     impl CompleteExitStatus {
@@ -719,6 +720,7 @@ mod tests {
     use std::sync::Once;
 
     static INIT: Once = Once::new();
+    static PID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
     fn before_all() {
         INIT.call_once(|| {
@@ -734,7 +736,7 @@ mod tests {
     #[tokio::test]
     async fn test_streaming() -> Result<(), anyhow::Error> {
         before_all();
-        let pid = 1;
+        let pid = PID_COUNTER.fetch_add(1, Ordering::SeqCst);
         let slow = std::env::current_exe()?
             .parent()
             .expect("removing test filename failed")
@@ -911,7 +913,7 @@ mod tests {
         #[tokio::test]
         async fn test_cgroup() -> Result<(), anyhow::Error> {
             before_all();
-            let pid = 1;
+            let pid = PID_COUNTER.fetch_add(1, Ordering::SeqCst);
             let env_conf = EnvVarConfiguration::new()?;
             let conf = DetectedCgroupConfiguration::new(&env_conf).await?;
             let cgroup_config_builder: CGroupConfigBuilder = conf.into();
