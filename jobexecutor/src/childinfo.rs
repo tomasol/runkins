@@ -675,7 +675,7 @@ impl ChildInfo {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     impl CompleteExitStatus {
         fn is_success(&self) -> bool {
@@ -718,6 +718,7 @@ mod tests {
     }
 
     use std::sync::Once;
+    use tokio::sync::mpsc::UnboundedReceiver;
 
     static INIT: Once = Once::new();
     static PID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -761,30 +762,39 @@ mod tests {
         child_info.add_client(client).await?;
         let complete_exit_status = child_info.wait_for_status().await?;
         assert!(complete_exit_status.is_success());
-        let expected_first_stdout = "0\nclosing stdout\n";
+        let expected_first_stdout = "0\nclosing stdout\n".as_bytes();
         assert_eq!(
+            read_std(&child_info, StdStream::StdOut).await?.as_bytes(),
             expected_first_stdout,
-            read_std(&child_info, StdStream::StdOut).await?,
         );
-        let expected_second_stderr = "1\n";
+        let expected_second_stderr = "1\n".as_bytes();
         assert_eq!(
-            read_std(&child_info, StdStream::StdErr).await?,
-            expected_second_stderr
-        );
-        // check timing
-        let (elapsed1, chunk) = rx.recv().await.expect("message not sent");
-        debug!("Got message {:?} after {:?}", chunk, elapsed1);
-        assert_eq!(
-            chunk,
-            Chunk::StdOut(expected_first_stdout.as_bytes().into())
+            read_std(&child_info, StdStream::StdErr).await?.as_bytes(),
+            expected_second_stderr,
         );
 
-        let (elapsed2, chunk) = rx.recv().await.expect("message not sent");
-        debug!("Got message {:?} after {:?}", chunk, elapsed2);
-        assert_eq!(
-            chunk,
-            Chunk::StdErr(expected_second_stderr.as_bytes().into())
-        );
+        async fn check_chunks(
+            rx: &mut UnboundedReceiver<(Duration, Chunk)>,
+            std_stream: StdStream,
+            mut expected: &[u8],
+        ) -> Duration {
+            loop {
+                let (elapsed1, chunk) = rx.recv().await.expect("message not sent");
+                debug!("Got message {:?} after {:?}", chunk, elapsed1);
+                let len = chunk.std_stream(std_stream).len();
+                let expected_chunk = Chunk::new(&std_stream, expected[0..len].into());
+                assert_eq!(chunk, expected_chunk);
+                expected = &expected[len..];
+                if expected.is_empty() {
+                    return elapsed1;
+                }
+            }
+        }
+
+        // check timing
+        let elapsed1 = check_chunks(&mut rx, StdStream::StdOut, expected_first_stdout).await;
+        let elapsed2 = check_chunks(&mut rx, StdStream::StdErr, expected_second_stderr).await;
+
         let dur = elapsed2 - elapsed1;
         assert!(
             dur.as_millis() >= 900,
