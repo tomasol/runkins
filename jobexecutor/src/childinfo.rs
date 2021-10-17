@@ -18,6 +18,7 @@ use tokio::process::ChildStdout;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 
 // TODO async fn with context
 
@@ -193,8 +194,8 @@ pub enum CompleteExitStatus {
     Unknown(String),
 }
 
-impl From<std::io::Result<ExitStatus>> for CompleteExitStatus {
-    fn from(src: std::io::Result<ExitStatus>) -> Self {
+impl<ERR: std::error::Error> From<Result<ExitStatus, ERR>> for CompleteExitStatus {
+    fn from(src: Result<ExitStatus, ERR>) -> Self {
         match src {
             Ok(status) => CompleteExitStatus::Complete(status.code().into()),
             Err(err) => CompleteExitStatus::Unknown(err.to_string()),
@@ -343,17 +344,16 @@ impl ChildInfo {
         main_tx: mpsc::Sender<ActorEvent>,
         stdout: ChildStdout,
         stderr: ChildStderr,
-    ) {
+    ) -> CompleteExitStatus {
         let out_handle = {
             let main_tx = main_tx.clone();
             spawn_named(&format!("[{}] stdout_forwarder", pid), async move {
-                ChildInfo::std_forwarder(pid, main_tx, stdout, StdStream::StdOut).await;
+                ChildInfo::std_forwarder(pid, main_tx, stdout, StdStream::StdOut).await
             })
         };
         let err_handle = {
-            let main_tx = main_tx.clone();
             spawn_named(&format!("[{}] stderr_forwarder", pid), async move {
-                ChildInfo::std_forwarder(pid, main_tx, stderr, StdStream::StdErr).await;
+                ChildInfo::std_forwarder(pid, main_tx, stderr, StdStream::StdErr).await
             })
         };
         let status = tokio::select! {
@@ -373,19 +373,15 @@ impl ChildInfo {
         if let Err(err) = err_handle.await {
             debug!("[{}] err_handle exitted with panic {:?}", pid, err);
         }
-        let send_result = main_tx.send(ActorEvent::ProcessFinished(status)).await;
-        if let Err(err) = send_result {
-            debug!(
-                "[{}] child_actor cannot send event {:?} to main_actor",
-                pid, err.0
-            );
-        }
+        debug!("[{}] child_actor is returning with {:?}", pid, status);
+        status
     }
 
     async fn main_actor(
         pid: Pid,
         mut rx: mpsc::Receiver<ActorEvent>,
         child_actor_tx: oneshot::Sender<()>,
+        mut child_handle: JoinHandle<CompleteExitStatus>,
     ) {
         fn send_back<T>(tx: oneshot::Sender<T>, reply: T, pid: Pid, event: &str) {
             let send_result = tx.send(reply);
@@ -407,6 +403,15 @@ impl ChildInfo {
                 Some(event) = rx.recv() => {
                     event
                 },
+                status = &mut child_handle, if status.as_running_state() == RunningState::Running => {
+                    match status {
+                        Ok(status) => ActorEvent::ProcessFinished(status),
+                        Err(err) => {
+                            error!("[{}] child_actor exitted with panic {:?}", pid, err);
+                            ActorEvent::ProcessFinished(Err(err).into())
+                        }
+                    }
+                }
                 else => {
                     debug!("[{}] main_actor is terminating", pid);
                     break;
@@ -590,6 +595,7 @@ impl ChildInfo {
     where
         STR: AsRef<OsStr>,
     {
+        info!("[{}] Starting new process: {:?}", pid, command);
         // consider adding ability to control env.vars
         command
             .current_dir(".") // consider making this configurable
@@ -619,16 +625,18 @@ impl ChildInfo {
 
         let (main_tx, main_rx) = mpsc::channel(1);
         let (child_tx, child_rx) = oneshot::channel();
-        spawn_named(&format!("[{}] main_actor", pid), async move {
-            ChildInfo::main_actor(pid, main_rx, child_tx).await;
-        });
 
-        {
+        let child_handle = {
             let main_tx = main_tx.clone();
             spawn_named(&format!("[{}] child_actor", pid), async move {
-                ChildInfo::child_actor(pid, child, child_rx, main_tx, stdout, stderr).await;
-            });
-        }
+                ChildInfo::child_actor(pid, child, child_rx, main_tx, stdout, stderr).await
+            })
+        };
+
+        spawn_named(&format!("[{}] main_actor", pid), async move {
+            ChildInfo::main_actor(pid, main_rx, child_tx, child_handle).await
+        });
+
         Ok(ChildInfo {
             pid,
             main_tx,
