@@ -13,6 +13,8 @@ use thiserror::Error;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio::process::Child;
+use tokio::process::ChildStderr;
+use tokio::process::ChildStdout;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -332,12 +334,28 @@ impl ChildInfo {
         }
     }
 
+    // Run stdout,stderr forwarders, then monitor for exit status.
+    // Leave only after forwarders are finished and exit status is obtained.
     async fn child_actor(
         pid: Pid,
         mut child: Child,
         child_actor_rx: oneshot::Receiver<()>,
         main_tx: mpsc::Sender<ActorEvent>,
+        stdout: ChildStdout,
+        stderr: ChildStderr,
     ) {
+        let out_handle = {
+            let main_tx = main_tx.clone();
+            spawn_named(&format!("[{}] stdout_forwarder", pid), async move {
+                ChildInfo::std_forwarder(pid, main_tx, stdout, StdStream::StdOut).await;
+            })
+        };
+        let err_handle = {
+            let main_tx = main_tx.clone();
+            spawn_named(&format!("[{}] stderr_forwarder", pid), async move {
+                ChildInfo::std_forwarder(pid, main_tx, stderr, StdStream::StdErr).await;
+            })
+        };
         let status = tokio::select! {
                 new_status = child.wait() => {
                     new_status
@@ -348,6 +366,13 @@ impl ChildInfo {
                 }
         }
         .into();
+        // Make sure forwarder tasks finish. Otherwise ChunkAdded events could be emitted after ProcessFinished.
+        if let Err(err) = out_handle.await {
+            debug!("[{}] out_handle exitted with panic {:?}", pid, err);
+        }
+        if let Err(err) = err_handle.await {
+            debug!("[{}] err_handle exitted with panic {:?}", pid, err);
+        }
         let send_result = main_tx.send(ActorEvent::ProcessFinished(status)).await;
         if let Err(err) = send_result {
             debug!(
@@ -440,7 +465,6 @@ impl ChildInfo {
                         });
                         chunks.push(chunk);
                     } else {
-                        // FIXME high: race between child_actor and std_forwarder
                         error!("[{}] main_actor got ChunkAdded with status {}", pid, status);
                     }
                 }
@@ -602,19 +626,7 @@ impl ChildInfo {
         {
             let main_tx = main_tx.clone();
             spawn_named(&format!("[{}] child_actor", pid), async move {
-                ChildInfo::child_actor(pid, child, child_rx, main_tx).await;
-            });
-        }
-        {
-            let main_tx = main_tx.clone();
-            spawn_named(&format!("[{}] stdout_forwarder", pid), async move {
-                ChildInfo::std_forwarder(pid, main_tx, stdout, StdStream::StdOut).await;
-            });
-        }
-        {
-            let main_tx = main_tx.clone();
-            spawn_named(&format!("[{}] stderr_forwarder", pid), async move {
-                ChildInfo::std_forwarder(pid, main_tx, stderr, StdStream::StdErr).await;
+                ChildInfo::child_actor(pid, child, child_rx, main_tx, stdout, stderr).await;
             });
         }
         Ok(ChildInfo {
