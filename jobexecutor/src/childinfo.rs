@@ -19,8 +19,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-
-// TODO async fn with context
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 #[derive(Error, Debug)]
 pub enum StopError {
@@ -259,6 +258,8 @@ impl ChildInfo {
         })
     }
 
+    // FIXME Make this private
+    //#[deprecated(note = "please use `stream_chunks` instead")]
     pub async fn add_client(&self, client: ClientAndClosure) -> Result<(), AddClientError> {
         self.main_tx
             .send(ActorEvent::ClientAdded(client))
@@ -267,6 +268,30 @@ impl ChildInfo {
                 error!("[{}] Cannot add_client: {}", self.pid, err);
                 AddClientError::MainActorFinished
             })
+    }
+
+    pub async fn stream_chunks<S: AsRef<str> + ?Sized>(
+        &self,
+        name: &S,
+    ) -> Result<UnboundedReceiverStream<Chunk>, AddClientError> {
+        // FIXME bounded channel that drops the slow client, e.g. tokio::sync::broadcast
+        let (tx, rx) = mpsc::unbounded_channel();
+        let client_and_closure = ClientAndClosure::new(
+            name.as_ref().to_string(),
+            Box::new(move |chunk| {
+                // FIXME Box
+                tx.send(chunk).map_err(|_| ())
+            }),
+        );
+
+        self.main_tx
+            .send(ActorEvent::ClientAdded(client_and_closure))
+            .await
+            .map_err(|err| {
+                error!("[{}] Cannot add_client: {}", self.pid, err);
+                AddClientError::MainActorFinished
+            })?;
+        Ok(UnboundedReceiverStream::new(rx))
     }
 
     pub async fn wait_for_status(&self) -> Result<CompleteExitStatus, StatusError> {

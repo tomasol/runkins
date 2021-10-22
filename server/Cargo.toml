@@ -20,6 +20,7 @@ tokio-stream = {version = "0.1", features = ["net"]}
 tonic = "0.5"
 console-subscriber = { git = "https://github.com/tokio-rs/console" }
 tracing-core = "0.1.20"
+futures-core = "0.3"
 
 [build-dependencies]
 tonic-build = "0.5"
