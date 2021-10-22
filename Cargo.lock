@@ -521,6 +521,7 @@ dependencies = [
  "anyhow",
  "console-subscriber",
  "env_logger",
+ "futures-core",
  "jobexecutor",
  "log",
  "prost",

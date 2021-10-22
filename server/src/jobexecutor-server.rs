@@ -1,3 +1,5 @@
+#![feature(type_alias_impl_trait)]
+
 use job_executor::job_executor_server::*;
 use job_executor::*;
 use jobexecutor::cgroup::concepts::CGroupLimits;
@@ -6,16 +8,14 @@ use jobexecutor::cgroup::server_config::CGroupConfigBuilder;
 use jobexecutor::cgroup::server_config::CGroupConfigError;
 use jobexecutor::childinfo::ChildInfo;
 use jobexecutor::childinfo::Chunk;
-use jobexecutor::childinfo::ClientAndClosure;
 use jobexecutor::childinfo::FinishedState;
 use jobexecutor::childinfo::Pid;
 use jobexecutor::childinfo::RunningState;
 use log::*;
 use rand::prelude::*;
 use std::collections::HashMap;
-use tokio::sync::mpsc;
 use tokio::sync::Mutex;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::StreamExt;
 use tonic::{transport::Server, Response};
 
 pub mod job_executor {
@@ -191,7 +191,7 @@ impl JobExecutor for MyJobExecutor {
         Ok(Response::new(job_executor::StopResponse {}))
     }
 
-    type GetOutputStream = UnboundedReceiverStream<Result<OutputResponse, tonic::Status>>;
+    type GetOutputStream = impl futures_core::Stream<Item = Result<OutputResponse, tonic::Status>>;
 
     async fn get_output(
         &self,
@@ -210,18 +210,12 @@ impl JobExecutor for MyJobExecutor {
             .get(&pid)
             .ok_or_else(|| tonic::Status::not_found("Cannot find job"))?;
 
-        let (tx, rx) = mpsc::unbounded_channel();
-        let client_and_closure = ClientAndClosure::new(
-            "client_id".to_string(),
-            Box::new(move |chunk| {
-                tx.send(MyJobExecutor::chunk_to_output(chunk)).map_err(|_| {
-                    info!("Client ? disconnected");
-                }) // TODO PID, IP
-            }),
-        );
-        child_info.add_client(client_and_closure).await?;
+        let stream = child_info
+            .stream_chunks("TODO:IP")
+            .await?
+            .map(MyJobExecutor::chunk_to_output);
 
-        Ok(Response::new(UnboundedReceiverStream::new(rx)))
+        Ok(Response::new(stream))
     }
 
     async fn remove(
