@@ -17,6 +17,7 @@ use tokio::process::ChildStderr;
 use tokio::process::ChildStdout;
 use tokio::process::Command;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -63,32 +64,27 @@ pub enum ChildInfoCreationWithCGroupError {
 
 /// Type of the writable part of a mpsc channel for streaming output chunks to a client.
 pub type Pid = u64;
-type ClientClosure = Box<dyn Fn(Chunk) -> Result<(), ()> + Send>; // TODO why Send?
 
-pub struct ClientAndClosure {
+struct Client {
     client_id: String,
-    closure: ClientClosure,
+    tx: UnboundedSender<Chunk>,
 }
 
-impl ClientAndClosure {
-    pub fn new(client_id: String, closure: ClientClosure) -> ClientAndClosure {
-        ClientAndClosure { client_id, closure }
-    }
-
-    fn call(&self, chunk: Chunk) -> Result<(), ()> {
-        (self.closure)(chunk)
+impl Client {
+    fn send(&self, chunk: Chunk) -> Result<(), ()> {
+        self.tx.send(chunk).map_err(|_| ())
     }
 }
 
-impl std::fmt::Debug for ClientAndClosure {
+impl std::fmt::Debug for Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClientAndClosure")
+        f.debug_struct("Client")
             .field("client_id", &self.client_id)
             .finish()
     }
 }
 
-impl Display for ClientAndClosure {
+impl Display for Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.client_id)
     }
@@ -97,7 +93,7 @@ impl Display for ClientAndClosure {
 #[derive(Debug)]
 enum ActorEvent {
     ChunkAdded(Chunk),                                // sent by std_forwarder
-    ClientAdded(ClientAndClosure),                    // sent by API call
+    ClientAdded(Client),                              // sent by API call
     ProcessFinished(CompleteExitStatus),              // sent by child_actor
     StatusRequest(oneshot::Sender<RunningState>),     // sent by API call
     KillRequest(oneshot::Sender<CompleteExitStatus>), // sent by API call
@@ -206,7 +202,7 @@ enum ExitStatusOrListeners {
     ExitStatus(CompleteExitStatus),
     Listeners {
         exit_listeners: Vec<oneshot::Sender<CompleteExitStatus>>,
-        clients: Vec<ClientAndClosure>,
+        clients: Vec<Client>,
     },
 }
 
@@ -258,37 +254,22 @@ impl ChildInfo {
         })
     }
 
-    // FIXME Make this private
-    //#[deprecated(note = "please use `stream_chunks` instead")]
-    pub async fn add_client(&self, client: ClientAndClosure) -> Result<(), AddClientError> {
-        self.main_tx
-            .send(ActorEvent::ClientAdded(client))
-            .await
-            .map_err(|err| {
-                error!("[{}] Cannot add_client: {}", self.pid, err);
-                AddClientError::MainActorFinished
-            })
-    }
-
     pub async fn stream_chunks<S: AsRef<str> + ?Sized>(
         &self,
         name: &S,
     ) -> Result<UnboundedReceiverStream<Chunk>, AddClientError> {
         // FIXME bounded channel that drops the slow client, e.g. tokio::sync::broadcast
         let (tx, rx) = mpsc::unbounded_channel();
-        let client_and_closure = ClientAndClosure::new(
-            name.as_ref().to_string(),
-            Box::new(move |chunk| {
-                // FIXME Box
-                tx.send(chunk).map_err(|_| ())
-            }),
-        );
+        let client_and_closure = Client {
+            client_id: name.as_ref().to_string(),
+            tx,
+        };
 
         self.main_tx
             .send(ActorEvent::ClientAdded(client_and_closure))
             .await
             .map_err(|err| {
-                error!("[{}] Cannot add_client: {}", self.pid, err);
+                error!("[{}] Cannot send ClientAdded: {}", self.pid, err);
                 AddClientError::MainActorFinished
             })?;
         Ok(UnboundedReceiverStream::new(rx))
@@ -558,16 +539,16 @@ impl ChildInfo {
     }
 
     // send everything to this client. This might be a bottleneck if many clients start connecting.
-    fn send_everything(pid: Pid, client: &ClientAndClosure, chunks: &[Chunk]) -> Result<(), ()> {
+    fn send_everything(pid: Pid, client: &Client, chunks: &[Chunk]) -> Result<(), ()> {
         for chunk in chunks {
             ChildInfo::send_chunk(pid, client, chunk.clone())?;
         }
         Ok(())
     }
 
-    fn send_chunk(pid: Pid, client: &ClientAndClosure, chunk: Chunk) -> Result<(), ()> {
+    fn send_chunk(pid: Pid, client: &Client, chunk: Chunk) -> Result<(), ()> {
         trace!("[{}] send_chunk chunk:{:?} client:{}", pid, chunk, client);
-        client.call(chunk)
+        client.send(chunk)
     }
 
     pub fn new<STR, STR2, ITER>(
@@ -701,6 +682,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
+    use tokio_stream::StreamExt;
 
     impl CompleteExitStatus {
         fn is_success(&self) -> bool {
@@ -776,15 +758,19 @@ mod tests {
         let start = Instant::now();
         debug!("Started at {:?}", start);
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let client = ClientAndClosure::new(
-            "client_id".to_string(),
-            Box::new(move |chunk| {
-                let elapsed = start.elapsed();
-                debug!("Got {:?} after {:?}", chunk, elapsed);
-                tx.send((elapsed, chunk)).map_err(|_| ())
-            }),
-        );
-        child_info.add_client(client).await?;
+
+        let mut stream = child_info.stream_chunks("client").await?.map(move |chunk| {
+            let elapsed = start.elapsed();
+            debug!("Got {:?} after {:?}", chunk, elapsed);
+            tx.send((elapsed, chunk)).map_err(|_| ())
+        });
+        let join_handle = tokio::spawn(async move {
+            while let Some(v) = stream.next().await {
+                debug!("GOT = {:?}", v);
+            }
+        });
+
+        join_handle.await?;
         let complete_exit_status = child_info.wait_for_status().await?;
         assert!(complete_exit_status.is_success());
         let expected_first_stdout = "0\nclosing stdout\n".as_bytes();
