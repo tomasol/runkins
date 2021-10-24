@@ -14,8 +14,9 @@ use jobexecutor::childinfo::RunningState;
 use log::*;
 use rand::prelude::*;
 use std::collections::HashMap;
+use std::pin::Pin;
 use tokio::sync::Mutex;
-use tokio_stream::StreamExt;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tonic::{transport::Server, Response};
 
 pub mod job_executor {
@@ -36,17 +37,19 @@ impl MyJobExecutor {
         }
     }
 
-    fn chunk_to_output(chunk: Chunk) -> Result<OutputResponse, tonic::Status> {
-        Ok(match chunk {
-            Chunk::StdOut(chunk) => OutputResponse {
-                std_out_chunk: Some(OutputChunk { chunk }),
-                std_err_chunk: None,
-            },
-            Chunk::StdErr(chunk) => OutputResponse {
-                std_out_chunk: None,
-                std_err_chunk: Some(OutputChunk { chunk }),
-            },
-        })
+    fn chunk_to_output(
+        item: Result<Chunk, BroadcastStreamRecvError>,
+    ) -> Result<OutputResponse, tonic::Status> {
+        match item {
+            Ok(Chunk { std_out, std_err }) => {
+                Ok(OutputResponse {
+                    // TODO set to None if no data is in chunk or make mandatory
+                    std_out_chunk: Some(OutputChunk { chunk: std_out }),
+                    std_err_chunk: Some(OutputChunk { chunk: std_err }),
+                })
+            }
+            Err(_) => Err(tonic::Status::data_loss("Please retry")),
+        }
     }
 
     fn construct_limits(request_cgroup: CGroup) -> CGroupLimits {
@@ -191,7 +194,9 @@ impl JobExecutor for MyJobExecutor {
         Ok(Response::new(job_executor::StopResponse {}))
     }
 
-    type GetOutputStream = impl futures_core::Stream<Item = Result<OutputResponse, tonic::Status>>;
+    type GetOutputStream = Pin<
+        Box<dyn futures_core::Stream<Item = Result<OutputResponse, tonic::Status>> + Send + Sync>,
+    >;
 
     async fn get_output(
         &self,
@@ -210,12 +215,12 @@ impl JobExecutor for MyJobExecutor {
             .get(&pid)
             .ok_or_else(|| tonic::Status::not_found("Cannot find job"))?;
 
-        let stream = child_info
+        let event_stream = child_info
             .stream_chunks("TODO:IP")
             .await?
-            .map(MyJobExecutor::chunk_to_output);
+            .into_stream(MyJobExecutor::chunk_to_output);
 
-        Ok(Response::new(stream))
+        Ok(Response::new(event_stream))
     }
 
     async fn remove(

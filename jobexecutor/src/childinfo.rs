@@ -6,7 +6,8 @@ use crate::cgroup::server_config::CGroupConfig;
 use crate::cgroup::server_config::ChildCGroup;
 use log::*;
 use std::ffi::OsStr;
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
+use std::pin::Pin;
 use std::process::ExitStatus;
 use std::process::Stdio;
 use thiserror::Error;
@@ -16,11 +17,13 @@ use tokio::process::Child;
 use tokio::process::ChildStderr;
 use tokio::process::ChildStdout;
 use tokio::process::Command;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::{Stream, StreamExt};
 
 #[derive(Error, Debug)]
 pub enum StopError {
@@ -62,43 +65,24 @@ pub enum ChildInfoCreationWithCGroupError {
     ProcessExecutionError(Pid, #[source] CGroupCommandError),
 }
 
-/// Type of the writable part of a mpsc channel for streaming output chunks to a client.
 pub type Pid = u64;
-
-struct Client {
-    client_id: String,
-    tx: UnboundedSender<Chunk>,
-}
-
-impl Client {
-    fn send(&self, chunk: Chunk) -> Result<(), ()> {
-        self.tx.send(chunk).map_err(|_| ())
-    }
-}
-
-impl std::fmt::Debug for Client {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Client")
-            .field("client_id", &self.client_id)
-            .finish()
-    }
-}
-
-impl Display for Client {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.client_id)
-    }
-}
 
 #[derive(Debug)]
 enum ActorEvent {
-    ChunkAdded(Chunk),                                // sent by std_forwarder
-    ClientAdded(Client),                              // sent by API call
-    ProcessFinished(CompleteExitStatus),              // sent by child_actor
-    StatusRequest(oneshot::Sender<RunningState>),     // sent by API call
-    KillRequest(oneshot::Sender<CompleteExitStatus>), // sent by API call
-    GetCurrentChunks(oneshot::Sender<Vec<Chunk>>),    // sent by API call
-    NotifyWhenProcessFinishes(oneshot::Sender<CompleteExitStatus>), // sent by API call
+    // sent by std_forwarder
+    ChunkAdded(Chunk),
+    // sent by API call
+    ClientAdded(String, oneshot::Sender<EventStream<Chunk>>),
+    // internal to main_actor
+    ProcessFinished(CompleteExitStatus),
+    // sent by API call
+    StatusRequest(oneshot::Sender<RunningState>),
+    // TODO depreaete. sent by API call
+    GetCurrentChunk(oneshot::Sender<Chunk>),
+    // sent by API call
+    KillRequest(oneshot::Sender<CompleteExitStatus>),
+    // sent by API call
+    NotifyWhenProcessFinishes(oneshot::Sender<CompleteExitStatus>),
 }
 
 #[derive(Debug)]
@@ -109,33 +93,60 @@ pub struct ChildInfo {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Chunk {
-    StdOut(Vec<u8>),
-    StdErr(Vec<u8>),
+pub struct Chunk {
+    pub std_out: Vec<u8>,
+    pub std_err: Vec<u8>,
 }
 
 impl Chunk {
     fn new(std_stream: &StdStream, content: Vec<u8>) -> Chunk {
         match std_stream {
-            StdStream::StdOut => Chunk::StdOut(content),
-            StdStream::StdErr => Chunk::StdErr(content),
+            StdStream::StdOut => Chunk {
+                std_out: content,
+                ..Default::default()
+            },
+            StdStream::StdErr => Chunk {
+                std_err: content,
+                ..Default::default()
+            },
         }
     }
 
+    // TODO remove?
     pub fn std_stream(&self, std_stream: StdStream) -> &[u8] {
-        match (std_stream, self) {
-            (StdStream::StdOut, Chunk::StdOut(content)) => content,
-            (StdStream::StdErr, Chunk::StdErr(content)) => content,
-            _ => &[],
+        match std_stream {
+            StdStream::StdOut => &self.std_out,
+            StdStream::StdErr => &self.std_err,
         }
     }
 
+    // TODO remove?
     pub fn std_out(&self) -> &[u8] {
         self.std_stream(StdStream::StdOut)
     }
 
+    //TODO remove?
     pub fn std_err(&self) -> &[u8] {
         self.std_stream(StdStream::StdErr)
+    }
+}
+
+impl Default for Chunk {
+    fn default() -> Self {
+        Chunk {
+            std_out: vec![],
+            std_err: vec![],
+        }
+    }
+}
+
+impl std::ops::Add for Chunk {
+    type Output = Chunk;
+
+    fn add(mut self, mut rhs: Self) -> Self::Output {
+        self.std_out.append(&mut rhs.std_out);
+        self.std_err.append(&mut rhs.std_err);
+        self
     }
 }
 
@@ -146,11 +157,13 @@ pub enum RunningState {
     Unknown(String),
     Finished(FinishedState),
 }
+
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum FinishedState {
     WithExitCode(i32),
     WithSignal,
 }
+
 impl From<Option<i32>> for FinishedState {
     fn from(maybe_code: Option<i32>) -> Self {
         match maybe_code {
@@ -200,19 +213,13 @@ impl<ERR: std::error::Error> From<Result<ExitStatus, ERR>> for CompleteExitStatu
 
 enum ExitStatusOrListeners {
     ExitStatus(CompleteExitStatus),
-    Listeners {
-        exit_listeners: Vec<oneshot::Sender<CompleteExitStatus>>,
-        clients: Vec<Client>,
-    },
+    Listeners(Vec<oneshot::Sender<CompleteExitStatus>>),
 }
 
 impl ExitStatusOrListeners {
     fn as_running_state(&self) -> RunningState {
         match self {
-            ExitStatusOrListeners::Listeners {
-                exit_listeners: _,
-                clients: _,
-            } => RunningState::Running,
+            ExitStatusOrListeners::Listeners(_) => RunningState::Running,
             ExitStatusOrListeners::ExitStatus(CompleteExitStatus::Complete(exit_status)) => {
                 RunningState::Finished(*exit_status)
             }
@@ -229,15 +236,98 @@ impl Display for ExitStatusOrListeners {
     }
 }
 
-/// ChildInfo represents the started process, its state, output and all associated data.
-/// It starts several async tasks to keep track of the output and running status.
-/// Note about generic types:
-/// OUTPUT is a type that represents the message written to a channel
-/// when streaming the output, see ClientTx type.
+#[derive(Debug)]
+pub enum EventStream<Item: Debug> {
+    OpenForEvents(Item, BroadcastStream<Item>),
+    ClosedForEvents(Item),
+}
+
+impl<Item: 'static + Debug + Clone + Send + Sync> EventStream<Item> {
+    pub fn into_accumulated(self) -> Item {
+        match self {
+            EventStream::OpenForEvents(item, _) => item,
+            EventStream::ClosedForEvents(item) => item,
+        }
+    }
+
+    // FIXME: should not require map_fun
+    pub fn into_stream<R, F>(self, map_fun: F) -> Pin<Box<dyn Stream<Item = R> + Send + Sync>>
+    where
+        R: 'static,
+        F: Fn(Result<Item, BroadcastStreamRecvError>) -> R + Send + Sync + 'static,
+    {
+        match self {
+            EventStream::OpenForEvents(item, stream) => Box::pin(
+                tokio_stream::once(item)
+                    .map(|item| Ok(item))
+                    .chain(stream)
+                    .map(map_fun),
+            ),
+            EventStream::ClosedForEvents(item) => {
+                Box::pin(tokio_stream::once(item).map(|item| Ok(item)).map(map_fun))
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct EventStorage<Item: Debug> {
+    accumulated: Item,
+    sender: Option<broadcast::Sender<Item>>, // set to None when finished
+}
+
+#[derive(Debug, Error)]
+enum AddEventError {
+    #[error("Cannot add event after calling no_more_events")]
+    AlreadyFinished,
+}
+
+impl<Item> EventStorage<Item>
+where
+    Item: Debug + Clone + Default + std::ops::Add<Output = Item> + Send + 'static,
+{
+    pub fn new(capacity: usize) -> Self {
+        let (sender, _receiver) = broadcast::channel(capacity);
+        EventStorage {
+            accumulated: Default::default(),
+            sender: Some(sender),
+        }
+    }
+
+    pub fn add_event(&mut self, event: Item) -> Result<(), AddEventError> {
+        // TODO low do not clone unless needed
+        self.accumulated = std::mem::take(&mut self.accumulated) + event.clone();
+
+        // Ignore possible sending errors when nobody is listening.
+        let _ = self
+            .sender
+            .as_ref()
+            .ok_or(AddEventError::AlreadyFinished)?
+            .send(event);
+        Ok(())
+    }
+
+    pub fn no_more_events(&mut self) {
+        self.sender.take();
+    }
+
+    pub fn get_event_stream(&self, client_id: String) -> EventStream<Item> {
+        debug!("{} Subscribing", client_id);
+        if let Some(sender) = &self.sender {
+            EventStream::OpenForEvents(
+                self.accumulated.clone(),
+                BroadcastStream::new(sender.subscribe()),
+            )
+        } else {
+            EventStream::ClosedForEvents(self.accumulated.clone())
+        }
+    }
+}
+
 impl ChildInfo {
-    async fn rpc<RESP>(
+    async fn rpc<F: Fn(oneshot::Sender<RESP>) -> ActorEvent, RESP>(
         &self,
-        event_fn: fn(oneshot::Sender<RESP>) -> ActorEvent,
+        event_fn: F,
     ) -> Result<RESP, ()> {
         let (oneshot_tx, oneshot_rx) = oneshot::channel();
         self.main_tx.send(event_fn(oneshot_tx)).await.map_err(|_| {
@@ -256,23 +346,11 @@ impl ChildInfo {
 
     pub async fn stream_chunks<S: AsRef<str> + ?Sized>(
         &self,
-        name: &S,
-    ) -> Result<UnboundedReceiverStream<Chunk>, AddClientError> {
-        // FIXME bounded channel that drops the slow client, e.g. tokio::sync::broadcast
-        let (tx, rx) = mpsc::unbounded_channel();
-        let client_and_closure = Client {
-            client_id: name.as_ref().to_string(),
-            tx,
-        };
-
-        self.main_tx
-            .send(ActorEvent::ClientAdded(client_and_closure))
+        client_id: &S,
+    ) -> Result<EventStream<Chunk>, AddClientError> {
+        self.rpc(|tx| ActorEvent::ClientAdded(client_id.as_ref().to_string(), tx))
             .await
-            .map_err(|err| {
-                error!("[{}] Cannot send ClientAdded: {}", self.pid, err);
-                AddClientError::MainActorFinished
-            })?;
-        Ok(UnboundedReceiverStream::new(rx))
+            .map_err(|_| AddClientError::MainActorFinished)
     }
 
     pub async fn wait_for_status(&self) -> Result<CompleteExitStatus, StatusError> {
@@ -281,18 +359,18 @@ impl ChildInfo {
             .map_err(|_| StatusError::MainActorFinished)
     }
 
-    pub async fn output(&self) -> Result<(CompleteExitStatus, Vec<Chunk>), OutputError> {
+    pub async fn output(&self) -> Result<(CompleteExitStatus, Chunk), OutputError> {
         let status = self
             .wait_for_status()
             .await
             .map_err(|_| OutputError::MainActorFinished)?;
 
-        let chunks = self
-            .rpc(ActorEvent::GetCurrentChunks)
+        let chunk = self
+            .rpc(ActorEvent::GetCurrentChunk)
             .await
             .map_err(|_| OutputError::MainActorFinished)?;
 
-        Ok((status, chunks))
+        Ok((status, chunk))
     }
 
     // Async task that reads StdStream and sends it in chunks
@@ -383,6 +461,8 @@ impl ChildInfo {
         status
     }
 
+    const EVENT_STORAGE_CAPACITY: usize = 32;
+
     async fn main_actor(
         pid: Pid,
         mut rx: mpsc::Receiver<ActorEvent>,
@@ -397,12 +477,8 @@ impl ChildInfo {
         }
         debug!("[{}] actor started", pid);
         let mut child_actor_tx = Some(child_actor_tx);
-        let mut chunks: Vec<Chunk> = vec![];
-
-        let mut status = ExitStatusOrListeners::Listeners {
-            exit_listeners: vec![],
-            clients: vec![],
-        };
+        let mut event_storage = EventStorage::new(Self::EVENT_STORAGE_CAPACITY);
+        let mut status = ExitStatusOrListeners::Listeners(vec![]);
 
         loop {
             let event = tokio::select! {
@@ -423,13 +499,7 @@ impl ChildInfo {
                     break;
                 }
             };
-            trace!(
-                "[{}] main_actor event={:?}, chunks={}, status={}",
-                pid,
-                event,
-                chunks.len(),
-                status,
-            );
+            trace!("[{}] main_actor event={:?}, status={}", pid, event, status);
             // FIXME: cleanup resources when panicing in main_actor
             match event {
                 ActorEvent::ProcessFinished(new_status) => {
@@ -437,11 +507,7 @@ impl ChildInfo {
                         "[{}] main_actor finished waiting for child process: {:?}",
                         pid, new_status
                     );
-                    if let ExitStatusOrListeners::Listeners {
-                        exit_listeners,
-                        clients: _,
-                    } = &mut status
-                    {
+                    if let ExitStatusOrListeners::Listeners(exit_listeners) = &mut status {
                         exit_listeners.drain(..).for_each(|listener| {
                             send_back(
                                 listener,
@@ -450,7 +516,8 @@ impl ChildInfo {
                                 "NotifyWhenProcessFinishes",
                             );
                         });
-                        // disconnect clients by dropping clients
+                        // disconnect clients
+                        event_storage.no_more_events();
                     } else {
                         error!(
                             "[{}] main_actor got ProcessFinished with status {}",
@@ -462,43 +529,22 @@ impl ChildInfo {
                 }
                 ActorEvent::ChunkAdded(chunk) => {
                     // notify all clients, removing disconnected
-                    if let ExitStatusOrListeners::Listeners {
-                        exit_listeners: _,
-                        clients,
-                    } = &mut status
-                    {
-                        clients.retain(|client| {
-                            ChildInfo::send_chunk(pid, client, chunk.clone())
-                                .map_err(|_| {
-                                    info!("[{}] main_actor removing client {}", pid, client);
-                                })
-                                .is_ok()
-                        });
-                        chunks.push(chunk);
-                    } else {
-                        error!("[{}] main_actor got ChunkAdded with status {}", pid, status);
+                    let result = event_storage.add_event(chunk);
+                    if let Err(err) = result {
+                        error!("[{}] main_actor got error on ChunkAdded: {}", pid, err);
                     }
                 }
-                ActorEvent::ClientAdded(client) => {
-                    let send_result = ChildInfo::send_everything(pid, &client, &chunks);
-
-                    if send_result.is_ok() {
-                        if let ExitStatusOrListeners::Listeners {
-                            exit_listeners: _,
-                            clients,
-                        } = &mut status
-                        {
-                            clients.push(client);
-                        }
-                    } else {
-                        info!(
-                                "[{}] main_actor not adding the client {}, error while replaying the output",
-                                pid, client
-                            );
-                    }
+                ActorEvent::ClientAdded(client_id, response_tx) => {
+                    let event_stream =
+                        event_storage.get_event_stream(format!("[{}] {}", pid, client_id));
+                    send_back(response_tx, event_stream, pid, "ClientAdded");
                 }
-                ActorEvent::GetCurrentChunks(response_tx) => {
-                    send_back(response_tx, chunks.clone(), pid, "GetCurrentChunks");
+                ActorEvent::GetCurrentChunk(response_tx) => {
+                    // TODO: Deprecate?
+                    let event_stream =
+                        event_storage.get_event_stream(format!("[{}] GetCurrentChunks", pid));
+                    let chunk = event_stream.into_accumulated();
+                    send_back(response_tx, chunk, pid, "GetCurrentChunks");
                 }
                 ActorEvent::StatusRequest(status_tx) => {
                     send_back(status_tx, status.as_running_state(), pid, "StatusRequest");
@@ -512,10 +558,7 @@ impl ChildInfo {
                         ExitStatusOrListeners::ExitStatus(ref status) => {
                             send_back(listener, status.clone(), pid, "KillRequest");
                         }
-                        ExitStatusOrListeners::Listeners {
-                            exit_listeners,
-                            clients: _,
-                        } => {
+                        ExitStatusOrListeners::Listeners(exit_listeners) => {
                             exit_listeners.push(listener);
                         }
                     }
@@ -526,29 +569,13 @@ impl ChildInfo {
                         ExitStatusOrListeners::ExitStatus(ref status) => {
                             send_back(listener, status.clone(), pid, "NotifyWhenProcessFinishes");
                         }
-                        ExitStatusOrListeners::Listeners {
-                            exit_listeners,
-                            clients: _,
-                        } => {
+                        ExitStatusOrListeners::Listeners(exit_listeners) => {
                             exit_listeners.push(listener);
                         }
                     }
                 }
             }
         }
-    }
-
-    // send everything to this client. This might be a bottleneck if many clients start connecting.
-    fn send_everything(pid: Pid, client: &Client, chunks: &[Chunk]) -> Result<(), ()> {
-        for chunk in chunks {
-            ChildInfo::send_chunk(pid, client, chunk.clone())?;
-        }
-        Ok(())
-    }
-
-    fn send_chunk(pid: Pid, client: &Client, chunk: Chunk) -> Result<(), ()> {
-        trace!("[{}] send_chunk chunk:{:?} client:{}", pid, chunk, client);
-        client.send(chunk)
     }
 
     pub fn new<STR, STR2, ITER>(
@@ -694,6 +721,7 @@ mod tests {
     }
 
     const EXPECTED_PROC_SELF_CGROUP_PREFIX: &str = "0::/";
+
     fn parse_proc_self_cgroup(stdout: &str) -> &str {
         debug!("/proc/self/cgroup: {}", stdout);
         assert!(
@@ -709,18 +737,13 @@ mod tests {
         child_info: &ChildInfo,
         std_stream: StdStream,
     ) -> Result<String, anyhow::Error> {
-        let (exit_status, chunks) = child_info.output().await?;
+        let (exit_status, chunk) = child_info.output().await?;
         assert!(
             exit_status.is_success(),
             "Running child process was not successful - {:?}",
             exit_status
         );
-        let out_bytes: Vec<u8> = chunks
-            .iter()
-            .map(|ch| ch.std_stream(std_stream))
-            .flatten()
-            .cloned()
-            .collect();
+        let out_bytes: Vec<u8> = chunk.std_stream(std_stream).to_vec();
         Ok(String::from_utf8(out_bytes)?)
     }
 
@@ -759,11 +782,15 @@ mod tests {
         debug!("Started at {:?}", start);
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let mut stream = child_info.stream_chunks("client").await?.map(move |chunk| {
-            let elapsed = start.elapsed();
-            debug!("Got {:?} after {:?}", chunk, elapsed);
-            tx.send((elapsed, chunk)).map_err(|_| ())
-        });
+        let mut stream =
+            child_info
+                .stream_chunks("client")
+                .await?
+                .into_stream(move |chunk_result| {
+                    let elapsed = start.elapsed();
+                    debug!("Got {:?} after {:?}", chunk_result, elapsed);
+                    tx.send((elapsed, chunk_result.unwrap())).map_err(|_| ())
+                });
         let join_handle = tokio::spawn(async move {
             while let Some(v) = stream.next().await {
                 debug!("GOT = {:?}", v);
