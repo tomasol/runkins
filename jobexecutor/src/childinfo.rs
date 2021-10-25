@@ -68,7 +68,7 @@ enum ActorEvent {
     // sent by std_forwarder
     ChunkAdded(Chunk),
     // sent by API call
-    ClientAdded(Option<String>, oneshot::Sender<EventSubscription<Chunk>>),
+    Subscribe(Option<String>, oneshot::Sender<EventSubscription<Chunk>>),
     // internal to main_actor
     ProcessFinished(CompleteExitStatus),
     // sent by API call
@@ -245,7 +245,7 @@ impl ChildInfo {
         &self,
         client_id: &S,
     ) -> Result<EventStream<Chunk>, AddClientError> {
-        self.rpc(|tx| ActorEvent::ClientAdded(Some(client_id.as_ref().to_string()), tx))
+        self.rpc(|tx| ActorEvent::Subscribe(Some(client_id.as_ref().to_string()), tx))
             .await
             .map(|subscription| subscription.into_stream())
             .map_err(|_| AddClientError::MainActorFinished)
@@ -264,7 +264,7 @@ impl ChildInfo {
             .map_err(|_| OutputError::MainActorFinished)?;
 
         let chunk = self
-            .rpc(|tx| ActorEvent::ClientAdded(None, tx))
+            .rpc(|tx| ActorEvent::Subscribe(None, tx))
             .await
             .map(|subscription| subscription.into_accumulated())
             .map_err(|_| OutputError::MainActorFinished)?;
@@ -433,7 +433,7 @@ impl ChildInfo {
                         error!("[{}] main_actor got error on ChunkAdded: {}", pid, err);
                     }
                 }
-                ActorEvent::ClientAdded(client_id, response_tx) => {
+                ActorEvent::Subscribe(client_id, response_tx) => {
                     if let Some(client_id) = client_id {
                         debug!("[{}] Subscribing {}", pid, client_id);
                     }
