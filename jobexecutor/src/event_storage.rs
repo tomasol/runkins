@@ -101,7 +101,7 @@ pub enum AddEventError {
 
 impl<I> EventStorage<I>
 where
-    // TODO replace Add with FnOnce
+    // TODO low replace Add with FnOnce
     I: Debug + Clone + Default + std::ops::Add<Output = I> + Send + 'static,
 {
     pub fn new(capacity: usize) -> Self {
@@ -129,8 +129,7 @@ where
         self.sender.take();
     }
 
-    pub fn get_event_holder(&self, client_id: String) -> EventSubscription<I> {
-        debug!("{} Subscribing", client_id);
+    pub fn get_event_holder(&self) -> EventSubscription<I> {
         if let Some(sender) = &self.sender {
             EventSubscription {
                 accumulated: self.accumulated.clone(),
