@@ -14,9 +14,9 @@ use jobexecutor::childinfo::RunningState;
 use log::*;
 use rand::prelude::*;
 use std::collections::HashMap;
-use std::pin::Pin;
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+use tokio_stream::StreamExt;
 use tonic::{transport::Server, Response};
 
 pub mod job_executor {
@@ -194,9 +194,7 @@ impl JobExecutor for MyJobExecutor {
         Ok(Response::new(job_executor::StopResponse {}))
     }
 
-    type GetOutputStream = Pin<
-        Box<dyn futures_core::Stream<Item = Result<OutputResponse, tonic::Status>> + Send + Sync>,
-    >;
+    type GetOutputStream = impl futures_core::Stream<Item = Result<OutputResponse, tonic::Status>>;
 
     async fn get_output(
         &self,
@@ -218,7 +216,7 @@ impl JobExecutor for MyJobExecutor {
         let event_stream = child_info
             .stream_chunks("TODO:IP")
             .await?
-            .into_stream(MyJobExecutor::chunk_to_output);
+            .map(MyJobExecutor::chunk_to_output);
 
         Ok(Response::new(event_stream))
     }
