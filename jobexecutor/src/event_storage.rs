@@ -16,12 +16,12 @@ pub struct EventSubscription<I: Debug> {
     broadcast: Option<BroadcastStream<I>>,
 }
 
-impl<I: 'static + Debug + Clone> EventSubscription<I> {
+impl<I: 'static + Debug + Clone + Send> EventSubscription<I> {
     pub fn into_accumulated(self) -> I {
         self.accumulated
     }
 
-    pub fn into_stream(self) -> EventStream<I> {
+    pub fn into_stream(self) -> impl Stream<Item = Result<I, BroadcastStreamRecvError>> {
         match self {
             EventSubscription {
                 accumulated: item,
@@ -40,7 +40,7 @@ type FirstItem<I> = Iter<option::IntoIter<Result<I, BroadcastStreamRecvError>>>;
 pin_project! {
     #[project = EventStreamProj]
     #[derive(Debug)]
-    pub enum EventStream<I: Debug> {
+    enum EventStream<I: Debug> {
         OpenForEvents{#[pin] first: FirstItem<I>, #[pin] broadcast: BroadcastStream<I>},
         ClosedForEvents{first: FirstItem<I>},
     }
@@ -129,7 +129,7 @@ where
         self.sender.take();
     }
 
-    pub fn get_event_holder(&self) -> EventSubscription<I> {
+    pub fn subscribe(&self) -> EventSubscription<I> {
         if let Some(sender) = &self.sender {
             EventSubscription {
                 accumulated: self.accumulated.clone(),

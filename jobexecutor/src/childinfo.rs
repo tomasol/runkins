@@ -4,7 +4,7 @@ use crate::cgroup::runtime::CGroupCommandFactory;
 use crate::cgroup::server_config::AutoCleanChildCGroup;
 use crate::cgroup::server_config::CGroupConfig;
 use crate::cgroup::server_config::ChildCGroup;
-use crate::event_storage::{EventStorage, EventStream, EventSubscription};
+use crate::event_storage::{EventStorage, EventSubscription};
 use log::*;
 use std::ffi::OsStr;
 use std::fmt::{Debug, Display};
@@ -20,6 +20,8 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+use tokio_stream::Stream;
 
 #[derive(Error, Debug)]
 pub enum StopError {
@@ -244,7 +246,7 @@ impl ChildInfo {
     pub async fn stream_chunks<S: AsRef<str> + ?Sized>(
         &self,
         client_id: &S,
-    ) -> Result<EventStream<Chunk>, AddClientError> {
+    ) -> Result<impl Stream<Item = Result<Chunk, BroadcastStreamRecvError>>, AddClientError> {
         self.rpc(|tx| ActorEvent::Subscribe(Some(client_id.as_ref().to_string()), tx))
             .await
             .map(|subscription| subscription.into_stream())
@@ -437,7 +439,7 @@ impl ChildInfo {
                     if let Some(client_id) = client_id {
                         debug!("[{}] Subscribing {}", pid, client_id);
                     }
-                    let event_stream = event_storage.get_event_holder();
+                    let event_stream = event_storage.subscribe();
                     send_back(response_tx, event_stream, pid, "ClientAdded");
                 }
                 ActorEvent::StatusRequest(status_tx) => {
