@@ -493,6 +493,7 @@ dependencies = [
  "envconfig",
  "libc",
  "log",
+ "pin-project-lite",
  "rand",
  "thiserror",
  "tokio",

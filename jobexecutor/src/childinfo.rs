@@ -4,7 +4,7 @@ use crate::cgroup::runtime::CGroupCommandFactory;
 use crate::cgroup::server_config::AutoCleanChildCGroup;
 use crate::cgroup::server_config::CGroupConfig;
 use crate::cgroup::server_config::ChildCGroup;
-use crate::event_storage::{EventStorage, EventStream};
+use crate::event_storage::{EventStorage, EventStream, EventSubscription};
 use log::*;
 use std::ffi::OsStr;
 use std::fmt::{Debug, Display};
@@ -68,7 +68,7 @@ enum ActorEvent {
     // sent by std_forwarder
     ChunkAdded(Chunk),
     // sent by API call
-    ClientAdded(String, oneshot::Sender<EventStream<Chunk>>),
+    ClientAdded(String, oneshot::Sender<EventSubscription<Chunk>>),
     // internal to main_actor
     ProcessFinished(CompleteExitStatus),
     // sent by API call
@@ -249,6 +249,7 @@ impl ChildInfo {
     ) -> Result<EventStream<Chunk>, AddClientError> {
         self.rpc(|tx| ActorEvent::ClientAdded(client_id.as_ref().to_string(), tx))
             .await
+            .map(|holder| holder.into_stream())
             .map_err(|_| AddClientError::MainActorFinished)
     }
 
@@ -265,7 +266,7 @@ impl ChildInfo {
             .map_err(|_| OutputError::MainActorFinished)?;
 
         let chunk = self
-            .rpc(ActorEvent::GetCurrentChunk)
+            .rpc(ActorEvent::GetCurrentChunk) // TODO use ClientAdded renamed to Subscribe
             .await
             .map_err(|_| OutputError::MainActorFinished)?;
 
@@ -435,14 +436,14 @@ impl ChildInfo {
                 }
                 ActorEvent::ClientAdded(client_id, response_tx) => {
                     let event_stream =
-                        event_storage.get_event_stream(format!("[{}] {}", pid, client_id));
+                        event_storage.get_event_holder(format!("[{}] {}", pid, client_id));
                     send_back(response_tx, event_stream, pid, "ClientAdded");
                 }
                 ActorEvent::GetCurrentChunk(response_tx) => {
                     // TODO: Deprecate?
-                    let event_stream =
-                        event_storage.get_event_stream(format!("[{}] GetCurrentChunks", pid));
-                    let chunk = event_stream.into_accumulated();
+                    let chunk = event_storage
+                        .get_event_holder(format!("[{}] GetCurrentChunks", pid))
+                        .into_accumulated();
                     send_back(response_tx, chunk, pid, "GetCurrentChunks");
                 }
                 ActorEvent::StatusRequest(status_tx) => {
@@ -681,15 +682,14 @@ mod tests {
         debug!("Started at {:?}", start);
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let mut stream =
-            child_info
-                .stream_chunks("client")
-                .await?
-                .into_stream(move |chunk_result| {
-                    let elapsed = start.elapsed();
-                    debug!("Got {:?} after {:?}", chunk_result, elapsed);
-                    tx.send((elapsed, chunk_result.unwrap())).map_err(|_| ())
-                });
+        let mut stream = child_info
+            .stream_chunks("client")
+            .await?
+            .map(move |chunk_result| {
+                let elapsed = start.elapsed();
+                debug!("Got {:?} after {:?}", chunk_result, elapsed);
+                tx.send((elapsed, chunk_result.unwrap())).map_err(|_| ())
+            });
         let join_handle = tokio::spawn(async move {
             while let Some(v) = stream.next().await {
                 debug!("GOT = {:?}", v);
