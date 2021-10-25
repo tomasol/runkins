@@ -68,13 +68,11 @@ enum ActorEvent {
     // sent by std_forwarder
     ChunkAdded(Chunk),
     // sent by API call
-    ClientAdded(String, oneshot::Sender<EventSubscription<Chunk>>),
+    ClientAdded(Option<String>, oneshot::Sender<EventSubscription<Chunk>>),
     // internal to main_actor
     ProcessFinished(CompleteExitStatus),
     // sent by API call
     StatusRequest(oneshot::Sender<RunningState>),
-    // TODO depreaete. sent by API call
-    GetCurrentChunk(oneshot::Sender<Chunk>),
     // sent by API call
     KillRequest(oneshot::Sender<CompleteExitStatus>),
     // sent by API call
@@ -247,9 +245,9 @@ impl ChildInfo {
         &self,
         client_id: &S,
     ) -> Result<EventStream<Chunk>, AddClientError> {
-        self.rpc(|tx| ActorEvent::ClientAdded(client_id.as_ref().to_string(), tx))
+        self.rpc(|tx| ActorEvent::ClientAdded(Some(client_id.as_ref().to_string()), tx))
             .await
-            .map(|holder| holder.into_stream())
+            .map(|subscription| subscription.into_stream())
             .map_err(|_| AddClientError::MainActorFinished)
     }
 
@@ -266,8 +264,9 @@ impl ChildInfo {
             .map_err(|_| OutputError::MainActorFinished)?;
 
         let chunk = self
-            .rpc(ActorEvent::GetCurrentChunk) // TODO use ClientAdded renamed to Subscribe
+            .rpc(|tx| ActorEvent::ClientAdded(None, tx))
             .await
+            .map(|subscription| subscription.into_accumulated())
             .map_err(|_| OutputError::MainActorFinished)?;
 
         Ok((status, chunk))
@@ -435,16 +434,11 @@ impl ChildInfo {
                     }
                 }
                 ActorEvent::ClientAdded(client_id, response_tx) => {
-                    let event_stream =
-                        event_storage.get_event_holder(format!("[{}] {}", pid, client_id));
+                    if let Some(client_id) = client_id {
+                        debug!("[{}] Subscribing {}", pid, client_id);
+                    }
+                    let event_stream = event_storage.get_event_holder();
                     send_back(response_tx, event_stream, pid, "ClientAdded");
-                }
-                ActorEvent::GetCurrentChunk(response_tx) => {
-                    // TODO: Deprecate?
-                    let chunk = event_storage
-                        .get_event_holder(format!("[{}] GetCurrentChunks", pid))
-                        .into_accumulated();
-                    send_back(response_tx, chunk, pid, "GetCurrentChunks");
                 }
                 ActorEvent::StatusRequest(status_tx) => {
                     send_back(status_tx, status.as_running_state(), pid, "StatusRequest");
