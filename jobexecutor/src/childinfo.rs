@@ -386,25 +386,31 @@ impl ChildInfo {
         }
         .into();
         debug!("[{}] child_actor got {:?}", pid, status);
-        // give std_forwarder actors a chance to leave. Start timeout task that sends poison pill to std_forwarders
-        spawn_named(
-            // breaks structured concurrency
-            &format!("[{}] std_forwarder_kill_timeout", pid),
-            async move {
-                time::sleep(Self::STD_FORWARDER_FINISH_TIMEOUT).await;
-                drop(kill_stdout_tx);
-                drop(kill_stderr_tx);
-            },
-        );
 
         // Make sure forwarder tasks finish. Otherwise ChunkAdded events could be emitted after ProcessFinished.
-        if let Err(err) = stdout_handle.await {
+        let mut std_results = futures::future::join_all(vec![stdout_handle, stderr_handle]);
+        let timer = async {
+            time::sleep(Self::STD_FORWARDER_FINISH_TIMEOUT).await;
+        };
+        let std_results = tokio::select! {
+            results = &mut std_results => {
+                results
+            }
+            _ = timer => {
+                debug!("[{}] timeout waiting for std_handles", pid);
+                drop(kill_stdout_tx);
+                drop(kill_stderr_tx);
+                std_results.await
+            }
+        };
+
+        if let Err(err) = &std_results[0] {
             debug!(
                 "[{}] child_actor: out_handle exitted with panic {:?}",
                 pid, err
             );
         }
-        if let Err(err) = stderr_handle.await {
+        if let Err(err) = &std_results[1] {
             debug!(
                 "[{}] child_actor: err_handle exitted with panic {:?}",
                 pid, err

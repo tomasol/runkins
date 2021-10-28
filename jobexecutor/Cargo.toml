@@ -11,6 +11,7 @@ tokio = {version = "1.0", features = ["rt-multi-thread", "macros", "sync", "proc
 tokio-stream = {version = "0.1", features = ["net", "sync"]}
 tonic = {version = "0.5", optional = true}
 pin-project-lite = "0.2"
+futures = "0.3.17"
 
 [dev-dependencies]
 anyhow = "1.0.42"
