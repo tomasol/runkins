@@ -20,7 +20,7 @@ use tokio::process::ChildStdout;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
+
 use tokio::time;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::Stream;
@@ -356,7 +356,7 @@ impl ChildInfo {
         main_tx: mpsc::Sender<ActorEvent>,
         stdout: ChildStdout,
         stderr: ChildStderr,
-    ) -> CompleteExitStatus {
+    ) {
         let (kill_stdout_tx, kill_stdout_rx) = mpsc::channel(1);
         let stdout_handle = {
             let main_tx = main_tx.clone();
@@ -367,6 +367,7 @@ impl ChildInfo {
         };
         let (kill_stderr_tx, kill_stderr_rx) = mpsc::channel(1);
         let stderr_handle = {
+            let main_tx = main_tx.clone();
             spawn_named(&format!("[{}] stderr_forwarder", pid), async move {
                 ChildInfo::std_forwarder(pid, main_tx, stderr, StdStream::StdErr, kill_stderr_rx)
                     .await
@@ -386,7 +387,7 @@ impl ChildInfo {
         .into();
         debug!("[{}] child_actor got {:?}", pid, status);
         // give std_forwarder actors a chance to leave. Start timeout task that sends poison pill to std_forwarders
-        spawn_named( 
+        spawn_named(
             // breaks structured concurrency
             &format!("[{}] std_forwarder_kill_timeout", pid),
             async move {
@@ -410,7 +411,10 @@ impl ChildInfo {
             );
         }
         debug!("[{}] child_actor is returning with {:?}", pid, status);
-        status
+        let send_result = main_tx.send(ActorEvent::ProcessFinished(status)).await;
+        if send_result.is_err() {
+            warn!("[{}] child_actor cannot send status to main_actor", pid);
+        }
     }
 
     const EVENT_STORAGE_CAPACITY: usize = 32;
@@ -419,12 +423,11 @@ impl ChildInfo {
         pid: Pid,
         mut rx: mpsc::Receiver<ActorEvent>,
         child_actor_tx: mpsc::Sender<()>,
-        mut child_handle: JoinHandle<CompleteExitStatus>,
     ) {
         fn send_back<T>(tx: oneshot::Sender<T>, reply: T, pid: Pid, event: &str) {
             let send_result = tx.send(reply);
             if send_result.is_err() {
-                debug!("[{}] main_actor cannot respond to {}", pid, event);
+                warn!("[{}] main_actor cannot respond to {}", pid, event);
             }
         }
         debug!("[{}] actor started", pid);
@@ -436,15 +439,6 @@ impl ChildInfo {
                 Some(event) = rx.recv() => {
                     event
                 },
-                status = &mut child_handle, if status.as_running_state() == RunningState::Running => {
-                    match status {
-                        Ok(status) => ActorEvent::ProcessFinished(status),
-                        Err(err) => {
-                            error!("[{}] child_actor exitted with panic {:?}", pid, err);
-                            ActorEvent::ProcessFinished(Err(err).into())
-                        }
-                    }
-                }
                 else => {
                     debug!("[{}] main_actor is terminating", pid);
                     break;
@@ -605,15 +599,15 @@ impl ChildInfo {
         let (main_tx, main_rx) = mpsc::channel(1);
         let (child_tx, child_rx) = mpsc::channel(1);
 
-        let child_handle = {
+        {
             let main_tx = main_tx.clone();
             spawn_named(&format!("[{}] child_actor", pid), async move {
                 ChildInfo::child_actor(pid, child, child_rx, main_tx, stdout, stderr).await
-            })
-        };
+            });
+        }
 
         spawn_named(&format!("[{}] main_actor", pid), async move {
-            ChildInfo::main_actor(pid, main_rx, child_tx, child_handle).await
+            ChildInfo::main_actor(pid, main_rx, child_tx).await
         });
 
         Ok(ChildInfo {
