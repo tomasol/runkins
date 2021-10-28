@@ -527,7 +527,6 @@ dependencies = [
  "log",
  "prost",
  "rand",
- "structopt",
  "tokio",
  "tokio-stream",
  "tonic",
