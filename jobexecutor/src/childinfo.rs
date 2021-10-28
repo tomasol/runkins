@@ -81,6 +81,19 @@ enum ActorEvent {
     NotifyWhenProcessFinishes(oneshot::Sender<CompleteExitStatus>),
 }
 
+impl Display for ActorEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ActorEvent::ChunkAdded(_) => f.write_str("ChunkAdded"),
+            ActorEvent::Subscribe(_, _) => f.write_str("Subscribe"),
+            ActorEvent::ProcessFinished(_) => f.write_str("ProcessFinished"),
+            ActorEvent::StatusRequest(_) => f.write_str("StatusRequest"),
+            ActorEvent::KillRequest(_) => f.write_str("KillRequest"),
+            ActorEvent::NotifyWhenProcessFinishes(_) => f.write_str("NotifyWhenProcessFinishes"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ChildInfo {
     pid: Pid,
@@ -325,7 +338,7 @@ impl ChildInfo {
     async fn child_actor(
         pid: Pid,
         mut child: Child,
-        child_actor_rx: oneshot::Receiver<()>,
+        mut child_actor_rx: mpsc::Receiver<()>,
         main_tx: mpsc::Sender<ActorEvent>,
         stdout: ChildStdout,
         stderr: ChildStderr,
@@ -341,22 +354,31 @@ impl ChildInfo {
                 ChildInfo::std_forwarder(pid, main_tx, stderr, StdStream::StdErr).await
             })
         };
-        let status = tokio::select! {
+        let status = loop {
+            tokio::select! {
                 new_status = child.wait() => {
-                    new_status
+                    break new_status;
                 }
-                _ = child_actor_rx => {
+                _ = child_actor_rx.recv() => {
+                    debug!("[{}] child_actor: start_kill", pid);
                     let _ = child.start_kill(); // ignore error when process is already killed
-                    child.wait().await
                 }
+            }
         }
         .into();
+        debug!("[{}] child_actor got {:?}", pid, status);
         // Make sure forwarder tasks finish. Otherwise ChunkAdded events could be emitted after ProcessFinished.
         if let Err(err) = out_handle.await {
-            debug!("[{}] out_handle exitted with panic {:?}", pid, err);
+            debug!(
+                "[{}] child_actor: out_handle exitted with panic {:?}",
+                pid, err
+            );
         }
         if let Err(err) = err_handle.await {
-            debug!("[{}] err_handle exitted with panic {:?}", pid, err);
+            debug!(
+                "[{}] child_actor: err_handle exitted with panic {:?}",
+                pid, err
+            );
         }
         debug!("[{}] child_actor is returning with {:?}", pid, status);
         status
@@ -367,7 +389,7 @@ impl ChildInfo {
     async fn main_actor(
         pid: Pid,
         mut rx: mpsc::Receiver<ActorEvent>,
-        child_actor_tx: oneshot::Sender<()>,
+        child_actor_tx: mpsc::Sender<()>,
         mut child_handle: JoinHandle<CompleteExitStatus>,
     ) {
         fn send_back<T>(tx: oneshot::Sender<T>, reply: T, pid: Pid, event: &str) {
@@ -377,7 +399,6 @@ impl ChildInfo {
             }
         }
         debug!("[{}] actor started", pid);
-        let mut child_actor_tx = Some(child_actor_tx);
         let mut event_storage = EventStorage::new(Self::EVENT_STORAGE_CAPACITY);
         let mut status = ExitStatusOrListeners::Listeners(vec![]);
 
@@ -400,7 +421,7 @@ impl ChildInfo {
                     break;
                 }
             };
-            trace!("[{}] main_actor event={:?}, status={}", pid, event, status);
+            debug!("[{}] main_actor event={}, status={}", pid, event, status);
             // FIXME: cleanup resources when panicing in main_actor
             match event {
                 ActorEvent::ProcessFinished(new_status) => {
@@ -429,7 +450,7 @@ impl ChildInfo {
                     status = ExitStatusOrListeners::ExitStatus(new_status);
                 }
                 ActorEvent::ChunkAdded(chunk) => {
-                    // notify all clients, removing disconnected
+                    // TODO: timestamps
                     let result = event_storage.add_event(chunk);
                     if let Err(err) = result {
                         error!("[{}] main_actor got error on ChunkAdded: {}", pid, err);
@@ -446,15 +467,14 @@ impl ChildInfo {
                     send_back(status_tx, status.as_running_state(), pid, "StatusRequest");
                 }
                 ActorEvent::KillRequest(listener) => {
-                    if let Some(child_actor_tx) = child_actor_tx.take() {
-                        send_back(child_actor_tx, (), pid, "KillRequest");
-                    }
-                    // either send back the reply now or add to exit_listeners
+                    // TODO: add kill -9
+                    // either send back the status now or kill and add to exit_listeners
                     match &mut status {
                         ExitStatusOrListeners::ExitStatus(ref status) => {
                             send_back(listener, status.clone(), pid, "KillRequest");
                         }
                         ExitStatusOrListeners::Listeners(exit_listeners) => {
+                            let _ = child_actor_tx.send(()).await; // if child_actor just finished, no problem
                             exit_listeners.push(listener);
                         }
                     }
@@ -524,7 +544,7 @@ impl ChildInfo {
     where
         STR: AsRef<OsStr>,
     {
-        info!("[{}] Starting new process: {:?}", pid, command);
+        debug!("[{}] Starting new process: {:?}", pid, command);
         // consider adding ability to control env.vars
         command
             .current_dir(".") // consider making this configurable
@@ -535,6 +555,12 @@ impl ChildInfo {
             info!("[{}] Cannot run process - {:?}", pid, process_path.as_ref());
             ChildInfoCreationError::CannotRunProcess(pid, err)
         })?;
+        debug!(
+            "[{}] Started new process with pid {:?} : {:?}",
+            pid,
+            child.id(),
+            command
+        );
 
         let stdout = child
             .stdout
@@ -553,7 +579,7 @@ impl ChildInfo {
             ))?;
 
         let (main_tx, main_rx) = mpsc::channel(1);
-        let (child_tx, child_rx) = oneshot::channel();
+        let (child_tx, child_rx) = mpsc::channel(1);
 
         let child_handle = {
             let main_tx = main_tx.clone();
