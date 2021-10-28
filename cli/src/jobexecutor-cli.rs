@@ -1,9 +1,10 @@
-use std::io::Write;
-
+use anyhow::anyhow;
 use anyhow::Context;
 use job_executor::job_executor_client::*;
 use job_executor::*;
 use log::*;
+use std::io::Write;
+use std::time::Duration;
 use structopt::StructOpt;
 use tonic::transport::Channel;
 
@@ -28,15 +29,15 @@ enum Subcommand {
         memory_swap_max: Option<u64>,
         // cpu.max: none or both values must be set
         #[structopt(
-            long,
-            help = "Set cpu.max, quota part, both parts must be set together",
-            requires_all(&["limits", "cpu-max-period-micros"])
+        long,
+        help = "Set cpu.max, quota part, both parts must be set together",
+        requires_all(& ["limits", "cpu-max-period-micros"])
         )]
         cpu_max_quota_micros: Option<u64>,
         #[structopt(
-            long,
-            help = "Set cpu.max, period part, both parts must be set together",
-            requires_all(&["limits", "cpu-max-quota-micros"])
+        long,
+        help = "Set cpu.max, period part, both parts must be set together",
+        requires_all(& ["limits", "cpu-max-quota-micros"])
         )]
         cpu_max_period_micros: Option<u64>,
         // io.max: not all values must be set
@@ -65,6 +66,12 @@ enum Subcommand {
     Remove {
         pid: Pid,
     },
+    WaitUntil {
+        pid: Pid,
+        message: String,
+        #[structopt(short, long, help = "Fail after given timeout")]
+        timeout_secs: Option<u64>,
+    },
 }
 
 #[tokio::main]
@@ -76,16 +83,13 @@ async fn main() -> anyhow::Result<()> {
     let client = JobExecutorClient::connect(addr)
         .await
         .with_context(|| format!("Cannot connect to {}", addr))?;
-    let result = send_request(opt, client)
-        .await
-        .map_err(|err| anyhow::anyhow!("Response error: {} - {}", err.message(), err.code()));
-    result
+    send_request(opt, client).await
 }
 
 async fn send_request(
     opt: Subcommand,
     mut client: JobExecutorClient<Channel>,
-) -> Result<(), tonic::Status> {
+) -> Result<(), anyhow::Error> {
     match opt {
         Subcommand::Start {
             path,
@@ -191,6 +195,57 @@ async fn send_request(
             let response = client.remove(request).await?;
             info!("Response={:?}", response);
         }
+        Subcommand::WaitUntil {
+            pid,
+            message,
+            timeout_secs,
+        } => {
+            let request = tonic::Request::new(OutputRequest {
+                id: Some(ExecutionId { id: pid }),
+            });
+            debug!("Request=${:?}", request);
+            let stream = client.get_output(request).await?.into_inner();
+            return wait_until(stream, message, timeout_secs.map(Duration::from_secs)).await;
+        }
     };
     Ok(())
+}
+
+async fn wait_until(
+    stream: tonic::Streaming<job_executor::OutputResponse>,
+    message: String,
+    timeout: Option<Duration>,
+) -> Result<(), anyhow::Error> {
+    let wait_until = wait_until_found(stream, message);
+    let start = std::time::SystemTime::now();
+    return if let Some(timeout) = timeout {
+        let timeout = async {
+            tokio::time::sleep(timeout).await;
+        };
+        tokio::select! {
+            result = wait_until => {
+                std::io::stderr().write_fmt(
+                    format_args!(
+                    "Found after {:?}", std::time::SystemTime::now().duration_since(start).unwrap()))?;
+                result
+            }
+            _ = timeout => {Err(anyhow!("Timeout"))}
+        }
+    } else {
+        wait_until.await
+    };
+}
+
+async fn wait_until_found(
+    mut stream: tonic::Streaming<job_executor::OutputResponse>,
+    message: String,
+) -> Result<(), anyhow::Error> {
+    while let Some(chunk) = stream.message().await? {
+        if let Some(output_chunk) = chunk.std_out_chunk {
+            if String::from_utf8_lossy(&output_chunk.chunk).contains(&message) {
+                return Ok(());
+            }
+        }
+    }
+    anyhow::bail!("Not found");
 }
