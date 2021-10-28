@@ -109,14 +109,16 @@ impl JobExecutor for MyJobExecutor {
         debug!("Request: {:?}", request);
         let start_req = request.into_inner();
 
-        // obtain lock
-        let mut store = self.child_storage.lock().await;
+        // obtain lock to generate pid
+        let store = self.child_storage.lock().await;
         let pid: Pid = loop {
             let random = thread_rng().gen();
             if !store.contains_key(&random) {
                 break random;
             }
         };
+        drop(store);
+
         debug!("Assigned pid {} to the child process", pid);
         let child_info = self
             .create_child_info(
@@ -125,8 +127,18 @@ impl JobExecutor for MyJobExecutor {
                 start_req.args,
                 start_req.cgroup.map(Self::construct_limits),
             )
-            .await?;
-        store.insert(pid, child_info);
+            .await?; // can block
+
+        let mut store = self.child_storage.lock().await;
+        let old_value = store.insert(pid, child_info);
+        drop(store);
+        if let Some(old_value) = old_value {
+            error!(
+                "Collistion on pid {}, killing the old process {:?}",
+                pid, old_value
+            );
+            old_value.kill().await?; // must not block
+        }
 
         Ok(Response::new(StartResponse {
             id: Some(ExecutionId { id: pid }),
@@ -152,6 +164,7 @@ impl JobExecutor for MyJobExecutor {
 
         let mut exit_code = None;
         let status = match child_info.status().await? {
+            // must not block
             RunningState::Running => Ok(job_executor::status_response::RunningStatus::Running),
             RunningState::Finished(FinishedState::WithExitCode(code)) => {
                 exit_code = Some(code);
@@ -190,7 +203,7 @@ impl JobExecutor for MyJobExecutor {
             .get(&pid)
             .ok_or_else(|| tonic::Status::not_found("Cannot find job"))?;
 
-        child_info.kill().await?;
+        child_info.kill().await?; // must not block
         Ok(Response::new(job_executor::StopResponse {}))
     }
 

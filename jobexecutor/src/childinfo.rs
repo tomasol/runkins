@@ -76,7 +76,7 @@ enum ActorEvent {
     // sent by API call
     StatusRequest(oneshot::Sender<RunningState>),
     // sent by API call
-    KillRequest(oneshot::Sender<CompleteExitStatus>),
+    KillRequest(),
     // sent by API call
     NotifyWhenProcessFinishes(oneshot::Sender<CompleteExitStatus>),
 }
@@ -88,7 +88,7 @@ impl Display for ActorEvent {
             ActorEvent::Subscribe(_, _) => f.write_str("Subscribe"),
             ActorEvent::ProcessFinished(_) => f.write_str("ProcessFinished"),
             ActorEvent::StatusRequest(_) => f.write_str("StatusRequest"),
-            ActorEvent::KillRequest(_) => f.write_str("KillRequest"),
+            ActorEvent::KillRequest() => f.write_str("KillRequest"),
             ActorEvent::NotifyWhenProcessFinishes(_) => f.write_str("NotifyWhenProcessFinishes"),
         }
     }
@@ -294,11 +294,21 @@ impl ChildInfo {
         tx: mpsc::Sender<ActorEvent>,
         mut reader: T,
         std_stream: StdStream,
+        mut kill_rx: mpsc::Receiver<()>,
     ) {
         debug!("[{}] std_forwarder({:?}) started", pid, std_stream);
         loop {
             let mut buffer = Vec::with_capacity(CHUNK_BUF_CAPACITY);
-            match reader.read_buf(&mut buffer).await {
+
+            let read_result = tokio::select! {
+                _ = kill_rx.recv() => {
+                    debug!("[{}] std_forwarder({:?}) got kill signal", pid, std_stream);
+                    Ok(0)
+                }
+                read_result = reader.read_buf(&mut buffer) => read_result
+            };
+
+            match read_result {
                 Ok(0) => {
                     debug!("[{}] std_forwarder({:?}) is done reading", pid, std_stream);
                     break;
@@ -343,15 +353,19 @@ impl ChildInfo {
         stdout: ChildStdout,
         stderr: ChildStderr,
     ) -> CompleteExitStatus {
-        let out_handle = {
+        let (kill_stdout_tx, kill_stdout_rx) = mpsc::channel(1);
+        let stdout_handle = {
             let main_tx = main_tx.clone();
             spawn_named(&format!("[{}] stdout_forwarder", pid), async move {
-                ChildInfo::std_forwarder(pid, main_tx, stdout, StdStream::StdOut).await
+                ChildInfo::std_forwarder(pid, main_tx, stdout, StdStream::StdOut, kill_stdout_rx)
+                    .await
             })
         };
-        let err_handle = {
+        let (kill_stderr_tx, kill_stderr_rx) = mpsc::channel(1);
+        let stderr_handle = {
             spawn_named(&format!("[{}] stderr_forwarder", pid), async move {
-                ChildInfo::std_forwarder(pid, main_tx, stderr, StdStream::StdErr).await
+                ChildInfo::std_forwarder(pid, main_tx, stderr, StdStream::StdErr, kill_stderr_rx)
+                    .await
             })
         };
         let status = loop {
@@ -367,14 +381,18 @@ impl ChildInfo {
         }
         .into();
         debug!("[{}] child_actor got {:?}", pid, status);
+        // drop std_out, std_err
+        drop(kill_stdout_tx);
+        drop(kill_stderr_tx);
+
         // Make sure forwarder tasks finish. Otherwise ChunkAdded events could be emitted after ProcessFinished.
-        if let Err(err) = out_handle.await {
+        if let Err(err) = stdout_handle.await {
             debug!(
                 "[{}] child_actor: out_handle exitted with panic {:?}",
                 pid, err
             );
         }
-        if let Err(err) = err_handle.await {
+        if let Err(err) = stderr_handle.await {
             debug!(
                 "[{}] child_actor: err_handle exitted with panic {:?}",
                 pid, err
@@ -466,17 +484,11 @@ impl ChildInfo {
                 ActorEvent::StatusRequest(status_tx) => {
                     send_back(status_tx, status.as_running_state(), pid, "StatusRequest");
                 }
-                ActorEvent::KillRequest(listener) => {
+                ActorEvent::KillRequest() => {
                     // TODO: add kill -9
                     // either send back the status now or kill and add to exit_listeners
-                    match &mut status {
-                        ExitStatusOrListeners::ExitStatus(ref status) => {
-                            send_back(listener, status.clone(), pid, "KillRequest");
-                        }
-                        ExitStatusOrListeners::Listeners(exit_listeners) => {
-                            let _ = child_actor_tx.send(()).await; // if child_actor just finished, no problem
-                            exit_listeners.push(listener);
-                        }
+                    if let ExitStatusOrListeners::Listeners(_) = &mut status {
+                        let _ = child_actor_tx.send(()).await; // ignore error if child_actor just finished
                     }
                 }
                 ActorEvent::NotifyWhenProcessFinishes(listener) => {
@@ -605,8 +617,9 @@ impl ChildInfo {
             .map_err(|_| StatusError::MainActorFinished)
     }
 
-    pub async fn kill(&self) -> Result<CompleteExitStatus, StopError> {
-        self.rpc(ActorEvent::KillRequest)
+    pub async fn kill(&self) -> Result<(), StopError> {
+        self.main_tx
+            .send(ActorEvent::KillRequest())
             .await
             .map_err(|_| StopError::MainActorFinished)
     }
