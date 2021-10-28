@@ -10,6 +10,7 @@ use std::ffi::OsStr;
 use std::fmt::{Debug, Display};
 use std::process::ExitStatus;
 use std::process::Stdio;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
@@ -20,6 +21,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+use tokio::time;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::Stream;
 
@@ -343,6 +345,8 @@ impl ChildInfo {
         }
     }
 
+    const STD_FORWARDER_FINISH_TIMEOUT: Duration = Duration::from_millis(100);
+
     // Run stdout,stderr forwarders, then monitor for exit status.
     // Leave only after forwarders are finished and exit status is obtained.
     async fn child_actor(
@@ -381,9 +385,16 @@ impl ChildInfo {
         }
         .into();
         debug!("[{}] child_actor got {:?}", pid, status);
-        // drop std_out, std_err
-        drop(kill_stdout_tx);
-        drop(kill_stderr_tx);
+        // give std_forwarder actors a chance to leave. Start timeout task that sends poison pill to std_forwarders
+        spawn_named( 
+            // breaks structured concurrency
+            &format!("[{}] std_forwarder_kill_timeout", pid),
+            async move {
+                time::sleep(Self::STD_FORWARDER_FINISH_TIMEOUT).await;
+                drop(kill_stdout_tx);
+                drop(kill_stderr_tx);
+            },
+        );
 
         // Make sure forwarder tasks finish. Otherwise ChunkAdded events could be emitted after ProcessFinished.
         if let Err(err) = stdout_handle.await {
@@ -440,6 +451,7 @@ impl ChildInfo {
                 }
             };
             debug!("[{}] main_actor event={}, status={}", pid, event, status);
+            trace!("[{}] main_actor event={:?}", pid, event);
             // FIXME: cleanup resources when panicing in main_actor
             match event {
                 ActorEvent::ProcessFinished(new_status) => {
