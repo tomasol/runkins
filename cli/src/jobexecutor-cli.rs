@@ -1,4 +1,3 @@
-use anyhow::anyhow;
 use anyhow::Context;
 use job_executor::job_executor_client::*;
 use job_executor::*;
@@ -68,7 +67,8 @@ enum Subcommand {
     },
     WaitUntil {
         pid: Pid,
-        message: String,
+        #[structopt(short, long, help = "Exit when message is found in std out")]
+        message: Option<String>,
         #[structopt(short, long, help = "Fail after given timeout")]
         timeout_secs: Option<u64>,
     },
@@ -213,39 +213,43 @@ async fn send_request(
 
 async fn wait_until(
     stream: tonic::Streaming<job_executor::OutputResponse>,
-    message: String,
+    message: Option<String>,
     timeout: Option<Duration>,
 ) -> Result<(), anyhow::Error> {
     let wait_until = wait_until_found(stream, message);
-    let start = std::time::SystemTime::now();
-    return if let Some(timeout) = timeout {
+    if let Some(timeout) = timeout {
         let timeout = async {
             tokio::time::sleep(timeout).await;
         };
         tokio::select! {
             result = wait_until => {
-                std::io::stderr().write_fmt(
-                    format_args!(
-                    "Found after {:?}", std::time::SystemTime::now().duration_since(start).unwrap()))?;
                 result
             }
-            _ = timeout => {Err(anyhow!("Timeout"))}
+            _ = timeout => {anyhow::bail!("Timeout")}
         }
     } else {
         wait_until.await
-    };
+    }
 }
 
+// Wait until message is found.
+// If message is not set, wait until the stream exits.
 async fn wait_until_found(
     mut stream: tonic::Streaming<job_executor::OutputResponse>,
-    message: String,
+    message: Option<String>,
 ) -> Result<(), anyhow::Error> {
     while let Some(chunk) = stream.message().await? {
         if let Some(output_chunk) = chunk.std_out_chunk {
-            if String::from_utf8_lossy(&output_chunk.chunk).contains(&message) {
-                return Ok(());
+            if let Some(message) = &message {
+                if String::from_utf8_lossy(&output_chunk.chunk).contains(message) {
+                    return Ok(());
+                }
             }
         }
     }
-    anyhow::bail!("Not found");
+    if message.is_some() {
+        anyhow::bail!("Not found")
+    } else {
+        Ok(())
+    }
 }
