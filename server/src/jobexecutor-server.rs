@@ -29,6 +29,20 @@ pub struct MyJobExecutor {
     cgroup_config: Option<CGroupConfig>,
 }
 
+trait EmptyIsNone<S> {
+    fn into_option(self) -> Option<S>;
+}
+
+impl<T> EmptyIsNone<Vec<T>> for Vec<T> {
+    fn into_option(self) -> Option<Vec<T>> {
+        if self.is_empty() {
+            None
+        } else {
+            Some(self)
+        }
+    }
+}
+
 impl MyJobExecutor {
     fn new(cgroup_config: Option<CGroupConfig>) -> MyJobExecutor {
         MyJobExecutor {
@@ -41,13 +55,10 @@ impl MyJobExecutor {
         item: Result<Chunk, BroadcastStreamRecvError>,
     ) -> Result<OutputResponse, tonic::Status> {
         match item {
-            Ok(Chunk { std_out, std_err }) => {
-                Ok(OutputResponse {
-                    // TODO set to None if no data is in chunk or make mandatory
-                    std_out_chunk: Some(OutputChunk { chunk: std_out }),
-                    std_err_chunk: Some(OutputChunk { chunk: std_err }),
-                })
-            }
+            Ok(Chunk { std_out, std_err }) => Ok(OutputResponse {
+                std_out_chunk: std_out.into_option().map(|it| OutputChunk { chunk: it }),
+                std_err_chunk: std_err.into_option().map(|it| OutputChunk { chunk: it }),
+            }),
             Err(_) => Err(tonic::Status::data_loss("Please retry")),
         }
     }
