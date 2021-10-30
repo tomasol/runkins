@@ -122,24 +122,6 @@ impl Chunk {
             },
         }
     }
-
-    // TODO remove?
-    pub fn std_stream(&self, std_stream: StdStream) -> &[u8] {
-        match std_stream {
-            StdStream::StdOut => &self.std_out,
-            StdStream::StdErr => &self.std_err,
-        }
-    }
-
-    // TODO remove?
-    pub fn std_out(&self) -> &[u8] {
-        self.std_stream(StdStream::StdOut)
-    }
-
-    //TODO remove?
-    pub fn std_err(&self) -> &[u8] {
-        self.std_stream(StdStream::StdErr)
-    }
 }
 
 impl std::ops::Add for Chunk {
@@ -680,20 +662,6 @@ mod tests {
         &stdout[EXPECTED_PROC_SELF_CGROUP_PREFIX.len()..stdout.len() - 1]
     }
 
-    async fn read_std(
-        child_info: &ChildInfo,
-        std_stream: StdStream,
-    ) -> Result<String, anyhow::Error> {
-        let (exit_status, chunk) = child_info.output().await?;
-        assert!(
-            exit_status.is_success(),
-            "Running child process was not successful - {:?}",
-            exit_status
-        );
-        let out_bytes: Vec<u8> = chunk.std_stream(std_stream).to_vec();
-        Ok(String::from_utf8(out_bytes)?)
-    }
-
     use std::sync::Once;
     use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -744,18 +712,12 @@ mod tests {
         });
 
         join_handle.await?;
-        let complete_exit_status = child_info.wait_for_status().await?;
+        let (complete_exit_status, chunk) = child_info.output().await?;
         assert!(complete_exit_status.is_success());
         let expected_first_stdout = "0\nclosing stdout\n".as_bytes();
-        assert_eq!(
-            read_std(&child_info, StdStream::StdOut).await?.as_bytes(),
-            expected_first_stdout,
-        );
+        assert_eq!(chunk.std_out, expected_first_stdout,);
         let expected_second_stderr = "1\n".as_bytes();
-        assert_eq!(
-            read_std(&child_info, StdStream::StdErr).await?.as_bytes(),
-            expected_second_stderr,
-        );
+        assert_eq!(chunk.std_err, expected_second_stderr,);
 
         async fn check_chunks(
             rx: &mut UnboundedReceiver<(Duration, Chunk)>,
@@ -765,7 +727,10 @@ mod tests {
             loop {
                 let (elapsed1, chunk) = rx.recv().await.expect("message not sent");
                 debug!("Got message {:?} after {:?}", chunk, elapsed1);
-                let len = chunk.std_stream(std_stream).len();
+                let len = match std_stream {
+                    StdStream::StdOut => chunk.std_out.len(),
+                    StdStream::StdErr => chunk.std_err.len(),
+                };
                 let expected_chunk = Chunk::new(&std_stream, expected[0..len].into());
                 assert_eq!(chunk, expected_chunk);
                 expected = &expected[len..];
@@ -932,9 +897,12 @@ mod tests {
                 )
                 .await?;
                 let _cleanup_child_folder = child_info.as_auto_clean();
-                let stdout = read_std(&child_info, StdStream::StdOut).await?;
-                let parent_cgroup =
-                    get_parent_cgroup_from_proc_self_cgroup(&stdout, &env_conf.cgroup_mount_point)?;
+                let (status, chunk) = child_info.output().await?;
+                assert!(status.is_success());
+                let parent_cgroup = get_parent_cgroup_from_proc_self_cgroup(
+                    &String::from_utf8_lossy(&chunk.std_out),
+                    &env_conf.cgroup_mount_point,
+                )?;
                 let child_path = parent_cgroup.join(format!("{}", pid));
 
                 assert_eq!(child_path, expected_child_cgroup_path);
@@ -952,7 +920,9 @@ mod tests {
                 )
                 .await?;
                 let _cleanup_child_folder = child_info.as_auto_clean();
-                let stdout = read_std(&child_info, StdStream::StdOut).await?;
+                let (status, chunk) = child_info.output().await?;
+                assert!(status.is_success());
+                let stdout = String::from_utf8_lossy(&chunk.std_out);
                 let caps: HashSet<&str> = stdout.split(' ').filter(|x| !x.is_empty()).collect();
                 debug!("Available controllers: `{}`", stdout);
                 assert!(
