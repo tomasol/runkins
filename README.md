@@ -1,16 +1,15 @@
-# jobexecutor
+# Runkins
 
 Folder structure:
-* cgexec-rs - binary `cgexec-rs` - used by the server to switch cgroup
-* cli - binary `jobexecutor-cli` - CLI
-* jobexecutor - library used by the server, `examples/slow` binary for testing
+* cli - binary `runkins` - CLI
+* lib - library used by the server, `examples/slow` binary for testing
 * proto - `*.proto` definition
-* server - binary `jobexecutor-server` - gRPC server
+* server - binary `runkins-server` - gRPC server
 * systemd - sample .service file
 
 ## Building
 ### Requirements
-* Minimum Supported Rust Version: 1.54.0
+* Rust 2021 edition
 
 For cgroup functionality (required when running a process with limits set):
 * cgroup v2 enabled
@@ -27,42 +26,49 @@ cargo build
 Alternatively run with ` --release` to get the release build.
 
 ## Running
+
+To see the error logs in the terminal, use
+```sh
+export RUST_LOG=runkins_server=debug,runkins_lib=debug,info
+ ```
+
 To run the server, execute:
 ```sh
-cargo run --bin jobexecutor-server
+cargo run --bin runkins-server
 ```
 This will start the gRPC server on (currently hardcoded)
 `localhost:50051`. The CLI has the same hardcoded address.
 
-To see the error logs in the terminal, use
-```sh
-export RUST_LOG=jobexecutor_server=debug,jobexecutor=debug,info
- ```
 
 ### CLI
 Each RPC is be executed as a separate CLI subcommand. To start
 a process, run
 ```sh
-cargo run --bin jobexecutor-cli start -- ls -la
+cargo run --bin runkins start -- ls -la
 ```
 The `start` subcommand outputs the Execution ID to stdout.
 All other subcommands (`status`, `stop`, `output`, `remove`) use it as an argument.
 Example workflow:
 ```sh
-EID=$(cargo run --bin jobexecutor-cli start -- ls -la)
-cargo run --bin jobexecutor-cli status $EID
-cargo run --bin jobexecutor-cli output $EID
-cargo run --bin jobexecutor-cli stop $EID
-cargo run --bin jobexecutor-cli remove $EID
+EID=$(cargo run --bin runkins start -- ls -la)
+cargo run --bin runkins status $EID
+cargo run --bin runkins output $EID
+cargo run --bin runkins stop $EID
+cargo run --bin runkins remove $EID
 ```
 To get help with commands, use `--help` flag.
+
+### Installing the CLI
+```sh
+cargo install --bin runkins --path cli
+```
 
 ## Testing
 ### Manual testing
 Start the server, then execute the binary
 [slow](jobexecutor/examples/slow.rs) created just for testing:
 ```sh
-EID=$(cargo run --bin jobexecutor-cli start -- \
+EID=$(cargo run --bin runkins start -- \
  cargo run --example slow 10)
 ```
 Test that the system works as expected. The `output` subcommand
@@ -113,29 +119,29 @@ systemctl start jobexecutor
 Verify that the process runs in its own cgroup:
 ```sh
 # note the --limits flag - if not set, cgroup will not be created
-$ EID=$(cargo run --bin jobexecutor-cli start --limits -- cat /proc/self/cgroup)
-$ cargo run --bin jobexecutor-cli output $EID
+$ EID=$(cargo run --bin runkins start --limits -- cat /proc/self/cgroup)
+$ cargo run --bin runkins output $EID
 0::/user.slice/user-1000.slice/user@1000.service/my.slice/15395846019127741322
-$ cargo run --bin jobexecutor-cli remove $EID
+$ cargo run --bin runkins remove $EID
 ```
 
 Verify that all required controllers `cpu io memory` are available:
 ```sh
-$ EID=$(cargo run --bin jobexecutor-cli start --limits -- \
+$ EID=$(cargo run --bin runkins start --limits -- \
  sh -c 'cat /sys/fs/cgroup/$(cat /proc/self/cgroup | cut -d ':' -f 3)/cgroup.controllers')
-$ cargo run --bin jobexecutor-cli output $EID
+$ cargo run --bin runkins output $EID
 cpu io memory pids
-$ cargo run --bin jobexecutor-cli remove $EID
+$ cargo run --bin runkins remove $EID
 ```
 
 ### Setting cgroup limits via CLI
 Switches for limits can be discovered using help.
 ```sh
-$ cargo run --bin jobexecutor-cli start --help
-jobexecutor-cli-start 0.1.0
+$ cargo run --bin runkins start --help
+runkins-start 0.1.0
 
 USAGE:
-    jobexecutor-cli start [FLAGS] [OPTIONS] <path> [args]...
+    runkins start [FLAGS] [OPTIONS] <path> [args]...
 
 FLAGS:
     -h, --help       Prints help information
@@ -161,11 +167,11 @@ Note that `--limits` flag must be set, otherwise the CLI will complain.
 Example:
 ```sh
 # this should succeed:
-$ EID=$(cargo run --bin jobexecutor-cli start \
+$ EID=$(cargo run --bin runkins start \
  --limits --memory-max 1000000 --memory-swap-max 0 -- \
   bash --help)
 # this should exit with signal:
-$ EID=$(cargo run --bin jobexecutor-cli start \
+$ EID=$(cargo run --bin runkins start \
  --limits --memory-max 100000 --memory-swap-max 0 -- \
   bash --help)
 ```

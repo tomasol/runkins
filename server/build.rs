@@ -1,5 +1,5 @@
 fn main() {
     tonic_build::configure()
-        .compile(&["../proto/jobexecutor/job_executor.proto"], &["../proto"])
+        .compile(&["../proto/runkins/runkins.proto"], &["../proto"])
         .unwrap();
 }
