@@ -119,7 +119,6 @@ pub mod server_config {
     #[derive(Debug)]
 
     pub struct ChildCGroup {
-        // TODO: cgroup deletion on drop?
         path: PathBuf,
     }
 

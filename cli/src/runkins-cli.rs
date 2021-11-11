@@ -1,14 +1,14 @@
 use anyhow::Context;
-use job_executor::job_executor_client::*;
-use job_executor::*;
 use log::*;
+use runkins::job_executor_client::*;
+use runkins::*;
 use std::io::Write;
 use std::time::Duration;
 use structopt::StructOpt;
 use tonic::transport::Channel;
 
-pub mod job_executor {
-    tonic::include_proto!("jobexecutor");
+pub mod runkins {
+    tonic::include_proto!("runkins");
 }
 
 type Pid = u64;
@@ -212,11 +212,12 @@ async fn send_request(
 }
 
 async fn wait_until(
-    stream: tonic::Streaming<job_executor::OutputResponse>,
+    stream: tonic::Streaming<OutputResponse>,
     message: Option<String>,
     timeout: Option<Duration>,
 ) -> Result<(), anyhow::Error> {
     let wait_until = wait_until_found(stream, message);
+    // TODO if duration = 0, take just one chunk out of the stream
     if let Some(timeout) = timeout {
         let timeout = async {
             tokio::time::sleep(timeout).await;
@@ -235,7 +236,7 @@ async fn wait_until(
 // Wait until message is found.
 // If message is not set, wait until the stream exits.
 async fn wait_until_found(
-    mut stream: tonic::Streaming<job_executor::OutputResponse>,
+    mut stream: tonic::Streaming<OutputResponse>,
     message: Option<String>,
 ) -> Result<(), anyhow::Error> {
     while let Some(chunk) = stream.message().await? {

@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package jobexecutor;
+package runkins;
 
 service JobExecutor {
     // Start new job, return ExecutionId handle for other RPCs

@@ -1,16 +1,16 @@
 [package]
 edition = "2021"
-name = "jobexecutor-server"
+name = "runkins-server"
 version = "0.1.0"
 
 [[bin]]
-name = "jobexecutor-server"
-path = "src/jobexecutor-server.rs"
+name = "runkins-server"
+path = "src/runkins-server.rs"
 
 [dependencies]
 anyhow = "1.0.42"
 env_logger = "0.9.0"
-jobexecutor = {path = "../jobexecutor", features = ["tonic"]}
+runkins-lib = {path = "../lib", features = ["tonic"]}
 log = "0.4.14"
 prost = "0.8"
 rand = "0.8"

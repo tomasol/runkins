@@ -517,57 +517,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b71991ff56294aa922b450139ee08b3bfc70982c6b2c7562771375cf73542dd4"
 
 [[package]]
-name = "jobexecutor"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "env_logger",
- "envconfig",
- "futures",
- "libc",
- "log",
- "pin-project-lite",
- "rand",
- "thiserror",
- "tokio",
- "tokio-stream",
- "tonic",
-]
-
-[[package]]
-name = "jobexecutor-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "env_logger",
- "log",
- "prost",
- "structopt",
- "tokio",
- "tonic",
- "tonic-build",
-]
-
-[[package]]
-name = "jobexecutor-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "console-subscriber",
- "env_logger",
- "futures-core",
- "jobexecutor",
- "log",
- "prost",
- "rand",
- "tokio",
- "tokio-stream",
- "tonic",
- "tonic-build",
- "tracing-core",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -930,6 +879,57 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3acd125665422973a33ac9d3dd2df85edad0f4ae9b00dafb1a05e43a9f5ef8e7"
 dependencies = [
  "winapi",
+]
+
+[[package]]
+name = "runkins"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "env_logger",
+ "log",
+ "prost",
+ "structopt",
+ "tokio",
+ "tonic",
+ "tonic-build",
+]
+
+[[package]]
+name = "runkins-lib"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "env_logger",
+ "envconfig",
+ "futures",
+ "libc",
+ "log",
+ "pin-project-lite",
+ "rand",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+]
+
+[[package]]
+name = "runkins-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "console-subscriber",
+ "env_logger",
+ "futures-core",
+ "log",
+ "prost",
+ "rand",
+ "runkins-lib",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
+ "tracing-core",
 ]
 
 [[package]]

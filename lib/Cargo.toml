@@ -1,6 +1,6 @@
 [package]
 edition = "2021"
-name = "jobexecutor"
+name = "runkins-lib"
 version = "0.1.0"
 
 [dependencies]

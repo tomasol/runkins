@@ -1,26 +1,26 @@
 #![feature(type_alias_impl_trait)]
 
-use job_executor::job_executor_server::*;
-use job_executor::*;
-use jobexecutor::cgroup::concepts::CGroupLimits;
-use jobexecutor::cgroup::server_config::CGroupConfig;
-use jobexecutor::cgroup::server_config::CGroupConfigBuilder;
-use jobexecutor::cgroup::server_config::CGroupConfigError;
-use jobexecutor::childinfo::ChildInfo;
-use jobexecutor::childinfo::Chunk;
-use jobexecutor::childinfo::FinishedState;
-use jobexecutor::childinfo::Pid;
-use jobexecutor::childinfo::RunningState;
 use log::*;
 use rand::prelude::*;
+use runkins::job_executor_server::*;
+use runkins::*;
+use runkins_lib::cgroup::concepts::CGroupLimits;
+use runkins_lib::cgroup::server_config::CGroupConfig;
+use runkins_lib::cgroup::server_config::CGroupConfigBuilder;
+use runkins_lib::cgroup::server_config::CGroupConfigError;
+use runkins_lib::childinfo::ChildInfo;
+use runkins_lib::childinfo::Chunk;
+use runkins_lib::childinfo::FinishedState;
+use runkins_lib::childinfo::Pid;
+use runkins_lib::childinfo::RunningState;
 use std::collections::HashMap;
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::StreamExt;
 use tonic::{transport::Server, Response};
 
-pub mod job_executor {
-    tonic::include_proto!("jobexecutor");
+pub mod runkins {
+    tonic::include_proto!("runkins");
 }
 
 #[derive(Debug)]
@@ -66,13 +66,13 @@ impl MyJobExecutor {
     fn construct_limits(request_cgroup: CGroup) -> CGroupLimits {
         let mut limits = CGroupLimits {
             cpu_limit: request_cgroup.cpu_limit.map(|cpu| {
-                jobexecutor::cgroup::concepts::CpuLimit {
+                runkins_lib::cgroup::concepts::CpuLimit {
                     cpu_max_quota_micros: cpu.cpu_max_quota_micros,
                     cpu_max_period_micros: cpu.cpu_max_period_micros,
                 }
             }),
             block_device_limit: request_cgroup.block_device_limit.map(|io| {
-                jobexecutor::cgroup::concepts::BlockDeviceLimit {
+                runkins_lib::cgroup::concepts::BlockDeviceLimit {
                     io_max_rbps: io.io_max_rbps,
                     io_max_riops: io.io_max_riops,
                     io_max_wbps: io.io_max_wbps,
@@ -115,8 +115,8 @@ impl MyJobExecutor {
 impl JobExecutor for MyJobExecutor {
     async fn start(
         &self,
-        request: tonic::Request<job_executor::StartRequest>,
-    ) -> Result<tonic::Response<job_executor::StartResponse>, tonic::Status> {
+        request: tonic::Request<StartRequest>,
+    ) -> Result<tonic::Response<StartResponse>, tonic::Status> {
         debug!("Request: {:?}", request);
         let start_req = request.into_inner();
 
@@ -158,8 +158,8 @@ impl JobExecutor for MyJobExecutor {
 
     async fn job_status(
         &self,
-        request: tonic::Request<job_executor::StatusRequest>,
-    ) -> Result<tonic::Response<job_executor::StatusResponse>, tonic::Status> {
+        request: tonic::Request<StatusRequest>,
+    ) -> Result<tonic::Response<StatusResponse>, tonic::Status> {
         debug!("Request: {:?}", request);
         let pid = request
             .into_inner()
@@ -176,13 +176,13 @@ impl JobExecutor for MyJobExecutor {
         let mut exit_code = None;
         let status = match child_info.status().await? {
             // must not block
-            RunningState::Running => Ok(job_executor::status_response::RunningStatus::Running),
+            RunningState::Running => Ok(status_response::RunningStatus::Running),
             RunningState::Finished(FinishedState::WithExitCode(code)) => {
                 exit_code = Some(code);
-                Ok(job_executor::status_response::RunningStatus::ExitedWithCode)
+                Ok(status_response::RunningStatus::ExitedWithCode)
             }
             RunningState::Finished(FinishedState::WithSignal) => {
-                Ok(job_executor::status_response::RunningStatus::ExitedWithSignal)
+                Ok(status_response::RunningStatus::ExitedWithSignal)
             }
             RunningState::Unknown(reason) => {
                 error!("[{}] Cannot get job status - {}", pid, reason);
@@ -191,7 +191,7 @@ impl JobExecutor for MyJobExecutor {
                 ))
             }
         }?;
-        Ok(Response::new(job_executor::StatusResponse {
+        Ok(Response::new(StatusResponse {
             status: status as i32,
             exit_code,
         }))
@@ -199,8 +199,8 @@ impl JobExecutor for MyJobExecutor {
 
     async fn stop(
         &self,
-        request: tonic::Request<job_executor::StopRequest>,
-    ) -> Result<tonic::Response<job_executor::StopResponse>, tonic::Status> {
+        request: tonic::Request<StopRequest>,
+    ) -> Result<tonic::Response<StopResponse>, tonic::Status> {
         debug!("Request: {:?}", request);
         let inner_request = request.into_inner();
         let pid = inner_request
@@ -215,14 +215,14 @@ impl JobExecutor for MyJobExecutor {
             .ok_or_else(|| tonic::Status::not_found("Cannot find job"))?;
 
         child_info.kill().await?; // must not block
-        Ok(Response::new(job_executor::StopResponse {}))
+        Ok(Response::new(StopResponse {}))
     }
 
     type GetOutputStream = impl futures_core::Stream<Item = Result<OutputResponse, tonic::Status>>;
 
     async fn get_output(
         &self,
-        request: tonic::Request<job_executor::OutputRequest>,
+        request: tonic::Request<OutputRequest>,
     ) -> Result<tonic::Response<Self::GetOutputStream>, tonic::Status> {
         debug!("Request: {:?}", request);
         let pid = request
@@ -247,8 +247,8 @@ impl JobExecutor for MyJobExecutor {
 
     async fn remove(
         &self,
-        request: tonic::Request<job_executor::RemoveRequest>,
-    ) -> Result<tonic::Response<job_executor::RemoveResponse>, tonic::Status> {
+        request: tonic::Request<RemoveRequest>,
+    ) -> Result<tonic::Response<RemoveResponse>, tonic::Status> {
         debug!("Request: {:?}", request);
         let pid = request
             .into_inner()
@@ -362,7 +362,7 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 pub mod tests {
-    use jobexecutor::childinfo::ChildInfoCreationError;
+    use runkins_lib::childinfo::ChildInfoCreationError;
 
     use super::*;
 

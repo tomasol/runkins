@@ -1,11 +1,11 @@
 [package]
 edition = "2021"
-name = "jobexecutor-cli"
+name = "runkins"
 version = "0.1.0"
 
 [[bin]]
-name = "jobexecutor-cli"
-path = "src/jobexecutor-cli.rs"
+name = "runkins"
+path = "src/runkins-cli.rs"
 
 [dependencies]
 anyhow = "1.0.42"
