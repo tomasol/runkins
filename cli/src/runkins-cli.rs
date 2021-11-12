@@ -61,6 +61,8 @@ enum Subcommand {
     },
     Output {
         pid: Pid,
+        #[structopt(short, long, help = "Exit after given timeout in seconds")]
+        timeout_secs: Option<u64>,
     },
     Remove {
         pid: Pid,
@@ -69,7 +71,7 @@ enum Subcommand {
         pid: Pid,
         #[structopt(short, long, help = "Exit when message is found in std out")]
         message: Option<String>,
-        #[structopt(short, long, help = "Fail after given timeout")]
+        #[structopt(short, long, help = "Fail after given timeout in seconds")]
         timeout_secs: Option<u64>,
     },
 }
@@ -138,6 +140,7 @@ async fn send_request(
             info!("Response={:?}", response);
             let id = response.into_inner().id.unwrap();
             println!("{}", id.id);
+            Ok(())
         }
         Subcommand::Status { pid } => {
             let request = tonic::Request::new(StatusRequest {
@@ -157,6 +160,7 @@ async fn send_request(
                 }
             };
             println!("{}", message);
+            Ok(())
         }
         Subcommand::Stop { pid } => {
             let request = tonic::Request::new(StopRequest {
@@ -165,25 +169,54 @@ async fn send_request(
             debug!("Request=${:?}", request);
             let response = client.stop(request).await?;
             info!("Response={:?}", response);
+            Ok(())
         }
-        Subcommand::Output { pid } => {
+        Subcommand::Output { pid, timeout_secs } => {
             let request = tonic::Request::new(OutputRequest {
                 id: Some(ExecutionId { id: pid }),
             });
             debug!("Request=${:?}", request);
             let mut stream = client.get_output(request).await?.into_inner();
-            let stdout = std::io::stdout();
-            // consider wrapping with std::io::BufWriter once write performance becomes an issue
-            // however buffer might add delays to streaming
-            let mut stdout = stdout.lock();
             let stderr = std::io::stderr();
             let mut stderr = stderr.lock();
-            while let Some(chunk) = stream.message().await? {
+            let stdout = std::io::stdout();
+            let mut stdout = stdout.lock();
+            let mut print_chunk = |chunk: OutputResponse| {
+                if let Some(output_chunk) = chunk.std_err_chunk {
+                    stderr.write_all(&output_chunk.chunk[..])?;
+                }
                 if let Some(output_chunk) = chunk.std_out_chunk {
                     stdout.write_all(&output_chunk.chunk[..])?;
                 }
-                if let Some(output_chunk) = chunk.std_err_chunk {
-                    stderr.write_all(&output_chunk.chunk[..])?;
+                Ok::<(), anyhow::Error>(())
+            };
+            let timeout = timeout_secs.map(Duration::from_secs);
+            match timeout {
+                Some(Duration::ZERO) => {
+                    // just print first chunk
+                    if let Some(chunk) = stream.message().await? {
+                        print_chunk(chunk)?;
+                    }
+                    Ok(())
+                }
+                _ => {
+                    let print_all = async {
+                        while let Some(chunk) = stream.message().await? {
+                            print_chunk(chunk)?;
+                        }
+                        Ok::<(), anyhow::Error>(())
+                    };
+                    match timeout {
+                        Some(timeout) => {
+                            tokio::select! { // print until stream finishes or timeout
+                                result = print_all => {
+                                    result
+                                }
+                                _ = tokio::time::sleep(timeout) => Ok(())
+                            }
+                        }
+                        None => print_all.await, // print until stream finishes
+                    }
                 }
             }
         }
@@ -194,6 +227,7 @@ async fn send_request(
             debug!("Request=${:?}", request);
             let response = client.remove(request).await?;
             info!("Response={:?}", response);
+            Ok(())
         }
         Subcommand::WaitUntil {
             pid,
@@ -207,8 +241,7 @@ async fn send_request(
             let stream = client.get_output(request).await?.into_inner();
             return wait_until(stream, message, timeout_secs.map(Duration::from_secs)).await;
         }
-    };
-    Ok(())
+    }
 }
 
 async fn wait_until(
@@ -218,18 +251,16 @@ async fn wait_until(
 ) -> Result<(), anyhow::Error> {
     let wait_until = wait_until_found(stream, message);
     // TODO if duration = 0, take just one chunk out of the stream
-    if let Some(timeout) = timeout {
-        let timeout = async {
-            tokio::time::sleep(timeout).await;
-        };
-        tokio::select! {
-            result = wait_until => {
-                result
+    match timeout {
+        Some(timeout) => {
+            tokio::select! {
+                result = wait_until => {
+                    result
+                }
+                _ = tokio::time::sleep(timeout) => {anyhow::bail!("Timeout")}
             }
-            _ = timeout => {anyhow::bail!("Timeout")}
         }
-    } else {
-        wait_until.await
+        None => wait_until.await,
     }
 }
 
