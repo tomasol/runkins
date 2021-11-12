@@ -54,20 +54,25 @@ enum Subcommand {
         args: Vec<String>,
     },
     Status {
+        #[structopt(env = "RUNKINS_EID")]
         pid: Pid,
     },
     Stop {
+        #[structopt(env = "RUNKINS_EID")]
         pid: Pid,
     },
     Output {
+        #[structopt(env = "RUNKINS_EID")]
         pid: Pid,
         #[structopt(short, long, help = "Exit after given timeout in seconds")]
         timeout_secs: Option<u64>,
     },
     Remove {
+        #[structopt(env = "RUNKINS_EID")]
         pid: Pid,
     },
     WaitUntil {
+        #[structopt(env = "RUNKINS_EID")]
         pid: Pid,
         #[structopt(short, long, help = "Exit when message is found in std out")]
         message: Option<String>,
@@ -79,6 +84,8 @@ enum Subcommand {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
+    // TODO allow disabling this via env var
+    dotenv::dotenv().ok();
     let opt = Subcommand::from_args();
     // TODO low: make this configurable
     let addr = "http://[::1]:50051";
