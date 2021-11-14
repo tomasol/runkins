@@ -1,13 +1,21 @@
 # Runkins
 
-Folder structure:
+Process executor with cgroup support and gRPC interface. Executes
+processes, stores stdout, stderr in memory and streams them to the CLI.
+
+## Possible use cases
+* Usage in scripts to manage long running processes that might outlive the script
+* Debugging where a full blown container runtime would get in the way but a better interface than plain linux is desired
+* Light-weight CI: steps in a workflow can be triggered by exit codes, stdout content, timeouts etc.
+
+## Folder structure
 * cli - binary `runkins` - CLI
 * lib - library used by the server, `examples/slow` binary for testing
 * proto - `*.proto` definition
 * server - binary `runkins-server` - gRPC server
 * systemd - sample .service file
 
-## Building
+## Usage
 ### Requirements
 * Rust 2021 edition
 
@@ -17,15 +25,12 @@ For cgroup functionality (required when running a process with limits set):
 
 More information can be found in the **cgroup** section.
 
-### cargo build
-To create a debug build of all components run
-```sh
-cargo build
-```
+### Installation
 
-Alternatively run with ` --release` to get the release build.
+TODO after publishing to crates.io, it should be possible to install by typing `cargo install runkins`
 
-## Running
+
+## Running the server
 
 To see the error logs in the terminal, use
 ```sh
@@ -39,37 +44,47 @@ cargo run --bin runkins-server
 This will start the gRPC server on (currently hardcoded)
 `localhost:50051`. The CLI has the same hardcoded address.
 
+Alternatively, use the systemd service example.
 
-### CLI
-Each RPC is be executed as a separate CLI subcommand. To start
-a process, run
+## Running the CLI
+To start a process, run
 ```sh
-cargo run --bin runkins start -- ls -la
+runkins start -- ls -la
 ```
-The `start` subcommand outputs the Execution ID to stdout.
-All other subcommands (`status`, `stop`, `output`, `remove`) use it as an argument.
+The `start` subcommand outputs the RUNKINS_EID to stdout.
+
+All other subcommands (`status`, `stop`, `output`, `remove`) expect to receive it
+either as the first parameter or as `RUNKINS_EID` environment variable.
+
 Example workflow:
 ```sh
-EID=$(cargo run --bin runkins start -- ls -la)
-cargo run --bin runkins status $EID
-cargo run --bin runkins output $EID
-cargo run --bin runkins stop $EID
-cargo run --bin runkins remove $EID
+RUNKINS_EID=$(runkins start -- ls -la)
+echo "RUNKINS_EID=$RUNKINS_EID" > .env
+runkins status
+runkins output
+runkins stop
+runkins remove
+rm .env
 ```
 To get help with commands, use `--help` flag.
 
-### Installing the CLI
+## Building
+
+### cargo build
+To create a debug build of all components run
 ```sh
-cargo install --bin runkins --path cli
+cargo build
 ```
+
+Alternatively run with ` --release` to get the release build.
+
 
 ## Testing
 ### Manual testing
 Start the server, then execute the binary
-[slow](jobexecutor/examples/slow.rs) created just for testing:
+[slow](lib/examples/slow.rs) created just for testing:
 ```sh
-EID=$(cargo run --bin runkins start -- \
- cargo run --example slow 10)
+RUNKINS_EID=$(runkins start -- cargo run --example slow 10)
 ```
 Test that the system works as expected. The `output` subcommand
 should write lines to stdout and stderr. After the program
@@ -90,12 +105,10 @@ To execute tests that are dependent on cgroup v2 and systemd-run, enable `test_s
 either via `RUST_FLAGS` or `.cargo/config`.
 
 ## cgroup support
-Please read [cgexec-rs](cgexec-rs/README.md) and verify it is working as described.
 
 Following environment variables need to be set, otherwise cgroup support will not be enabled.
 * PARENT_CGROUP - full path to a cgroup directory that can be written by the current user
 * CGROUP_BLOCK_DEVICE_ID - in form of MAJOR:MINOR, see `lsblk`
-* CGEXEC_RS - path to cgexec-rs binary, might be omitted if it lives in the same folder as `jobexecutor-server`
 * CGROUP_MOVE_CURRENT_PID_TO_SUBFOLDER_ENABLED - required for systemd service support. If set (to anything), creates PARENT_CGROUP/service cgroup if needed and moves current pid there. This setting also adds the required controllres to $PARENT_CGROUP/cgroup.subtree_control .
 
 ### Starting new user slice using systemd-run
@@ -107,31 +120,25 @@ $ systemd-run --user -p Delegate=yes --slice=my.slice --shell
 # export PARENT_CGROUP=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/my.slice
 ```
 
-### Managing the slice and service using systemd .service file
-Create file `jobexecutor.service` based on `systemd/jobexecutor-sample.service` and
-move/link it to `/etc/systemd/system/` folder. Then start the service:
-```sh
-systemctl daemon-reload
-systemctl start jobexecutor
-```
-
 ### Verification
+TODO: this should be a healthcheck running on the server startup.
+
 Verify that the process runs in its own cgroup:
 ```sh
 # note the --limits flag - if not set, cgroup will not be created
-$ EID=$(cargo run --bin runkins start --limits -- cat /proc/self/cgroup)
-$ cargo run --bin runkins output $EID
+$ RUNKINS_EID=$(cargo run --bin runkins start --limits -- cat /proc/self/cgroup)
+$ cargo run --bin runkins output $RUNKINS_EID
 0::/user.slice/user-1000.slice/user@1000.service/my.slice/15395846019127741322
-$ cargo run --bin runkins remove $EID
+$ cargo run --bin runkins remove $RUNKINS_EID
 ```
 
 Verify that all required controllers `cpu io memory` are available:
 ```sh
-$ EID=$(cargo run --bin runkins start --limits -- \
+$ RUNKINS_EID=$(cargo run --bin runkins start --limits -- \
  sh -c 'cat /sys/fs/cgroup/$(cat /proc/self/cgroup | cut -d ':' -f 3)/cgroup.controllers')
-$ cargo run --bin runkins output $EID
+$ cargo run --bin runkins output $RUNKINS_EID
 cpu io memory pids
-$ cargo run --bin runkins remove $EID
+$ cargo run --bin runkins remove $RUNKINS_EID
 ```
 
 ### Setting cgroup limits via CLI
@@ -167,11 +174,11 @@ Note that `--limits` flag must be set, otherwise the CLI will complain.
 Example:
 ```sh
 # this should succeed:
-$ EID=$(cargo run --bin runkins start \
+$ RUNKINS_EID=$(runkins start \
  --limits --memory-max 1000000 --memory-swap-max 0 -- \
   bash --help)
 # this should exit with signal:
-$ EID=$(cargo run --bin runkins start \
+$ RUNKINS_EID=$(runkins start \
  --limits --memory-max 100000 --memory-swap-max 0 -- \
   bash --help)
 ```

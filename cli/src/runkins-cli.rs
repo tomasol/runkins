@@ -17,6 +17,7 @@ type Pid = u64;
 #[structopt(about = "Job executor CLI")]
 enum Subcommand {
     Start {
+        // TODO: add --set-dot-env, pass current CWD, pass current env vars
         // TODO low: allow setting limits in human writable form e.g. 10MB, 5ms, etc.
         #[structopt(short, long, help = "Enable cgroup limits")]
         limits: bool,
