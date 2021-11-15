@@ -1,13 +1,18 @@
 [package]
 edition = "2021"
-name = "runkins"
+name = "runkins_cli"
 version = "0.1.0"
+description = "Runkins makes it easy to manage command execution."
+homepage = "https://github.com/tomasol/runkins"
+license = "MIT"
+repository = "https://github.com/tomasol/runkins"
 
 [[bin]]
 name = "runkins"
 path = "src/runkins-cli.rs"
 
 [dependencies]
+runkins_proto = {path = "../proto"}
 anyhow = "1.0.42"
 dotenv = "0.15.0"
 env_logger = "0.9.0"
@@ -16,6 +21,3 @@ prost = "0.8"
 structopt = "0.3.22"
 tokio = {version = "1.0", features = ["rt-multi-thread", "macros", "sync"]}
 tonic = "0.5"
-
-[build-dependencies]
-tonic-build = "0.5"

@@ -3,6 +3,8 @@ resolver = "2"
 
 members = [
   "lib",
+  "proto",
   "server",
   "cli",
+  "all",
 ]

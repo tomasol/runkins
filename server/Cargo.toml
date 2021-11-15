@@ -1,7 +1,11 @@
 [package]
 edition = "2021"
-name = "runkins-server"
+name = "runkins_server"
 version = "0.1.0"
+description = "Runkins makes it easy to manage command execution."
+homepage = "https://github.com/tomasol/runkins"
+license = "MIT"
+repository = "https://github.com/tomasol/runkins"
 
 [[bin]]
 name = "runkins-server"
@@ -10,16 +14,14 @@ path = "src/runkins-server.rs"
 [dependencies]
 anyhow = "1.0.42"
 env_logger = "0.9.0"
-runkins-lib = {path = "../lib", features = ["tonic"]}
+runkins_lib = {path = "../lib", features = ["tonic"]}
+runkins_proto = {path = "../proto"}
 log = "0.4.14"
 prost = "0.8"
 rand = "0.8"
 tokio = {version = "1.0", features = ["rt-multi-thread", "macros", "sync", "time", "process"]}
 tokio-stream = {version = "0.1", features = ["net"]}
 tonic = "0.5"
-console-subscriber = { git = "https://github.com/tokio-rs/console" }
 tracing-core = "0.1.20"
 futures-core = "0.3"
-
-[build-dependencies]
-tonic-build = "0.5"
+#console-subscriber = { git = "https://github.com/tokio-rs/console" }
