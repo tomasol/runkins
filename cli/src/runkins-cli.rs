@@ -1,15 +1,11 @@
 use anyhow::Context;
 use log::*;
-use runkins::job_executor_client::*;
-use runkins::*;
+use runkins_proto::runkins::job_executor_client::*;
+use runkins_proto::runkins::*;
 use std::io::Write;
 use std::time::Duration;
 use structopt::StructOpt;
 use tonic::transport::Channel;
-
-pub mod runkins {
-    tonic::include_proto!("runkins");
-}
 
 type Pid = u64;
 
@@ -63,12 +59,14 @@ enum Subcommand {
         pid: Pid,
     },
     Output {
+        // TODO: rename to log(s)
         #[structopt(env = "RUNKINS_EID")]
         pid: Pid,
         #[structopt(short, long, help = "Exit after given timeout in seconds")]
         timeout_secs: Option<u64>,
     },
     Remove {
+        // TODO implement --force
         #[structopt(env = "RUNKINS_EID")]
         pid: Pid,
     },
@@ -80,6 +78,7 @@ enum Subcommand {
         #[structopt(short, long, help = "Fail after given timeout in seconds")]
         timeout_secs: Option<u64>,
     },
+    // TODO implement ps, ps -a
 }
 
 #[tokio::main]

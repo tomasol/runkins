@@ -2,8 +2,6 @@
 
 use log::*;
 use rand::prelude::*;
-use runkins::job_executor_server::*;
-use runkins::*;
 use runkins_lib::cgroup::concepts::CGroupLimits;
 use runkins_lib::cgroup::server_config::CGroupConfig;
 use runkins_lib::cgroup::server_config::CGroupConfigBuilder;
@@ -13,15 +11,13 @@ use runkins_lib::childinfo::Chunk;
 use runkins_lib::childinfo::FinishedState;
 use runkins_lib::childinfo::Pid;
 use runkins_lib::childinfo::RunningState;
+use runkins_proto::runkins::job_executor_server::*;
+use runkins_proto::runkins::*;
 use std::collections::HashMap;
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::StreamExt;
 use tonic::{transport::Server, Response};
-
-pub mod runkins {
-    tonic::include_proto!("runkins");
-}
 
 #[derive(Debug)]
 pub struct MyJobExecutor {
