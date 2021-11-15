@@ -25,9 +25,9 @@ For cgroup functionality (required when running a process with limits set):
 More information can be found in the **cgroup** section.
 
 ### Installation
-
-TODO after publishing to crates.io, it should be possible to install by typing `cargo install runkins`
-
+```sh
+cargo install runkins
+```
 
 ## Running the server
 
@@ -38,7 +38,7 @@ export RUST_LOG=runkins_server=debug,runkins_lib=debug,info
 
 To run the server, execute:
 ```sh
-cargo run --bin runkins-server
+runkins-server
 ```
 This will start the gRPC server on (currently hardcoded)
 `localhost:50051`. The CLI has the same hardcoded address.
@@ -125,25 +125,25 @@ TODO: this should be a healthcheck running on the server startup.
 Verify that the process runs in its own cgroup:
 ```sh
 # note the --limits flag - if not set, cgroup will not be created
-$ RUNKINS_EID=$(cargo run --bin runkins start --limits -- cat /proc/self/cgroup)
-$ cargo run --bin runkins output $RUNKINS_EID
+$ RUNKINS_EID=$(runkins start --limits -- cat /proc/self/cgroup)
+$ runkins output $RUNKINS_EID
 0::/user.slice/user-1000.slice/user@1000.service/my.slice/15395846019127741322
-$ cargo run --bin runkins remove $RUNKINS_EID
+$ runkins remove $RUNKINS_EID
 ```
 
 Verify that all required controllers `cpu io memory` are available:
 ```sh
-$ RUNKINS_EID=$(cargo run --bin runkins start --limits -- \
+$ RUNKINS_EID=$(runkins start --limits -- \
  sh -c 'cat /sys/fs/cgroup/$(cat /proc/self/cgroup | cut -d ':' -f 3)/cgroup.controllers')
-$ cargo run --bin runkins output $RUNKINS_EID
+$ runkins output $RUNKINS_EID
 cpu io memory pids
-$ cargo run --bin runkins remove $RUNKINS_EID
+$ runkins remove $RUNKINS_EID
 ```
 
 ### Setting cgroup limits via CLI
 Switches for limits can be discovered using help.
 ```sh
-$ cargo run --bin runkins start --help
+$ runkins start --help
 runkins-start 0.1.0
 
 USAGE:
