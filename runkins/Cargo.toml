@@ -14,12 +14,12 @@ server = ["runkins_lib","rand","tokio-stream","tracing-core","futures-core"]
 
 [[bin]]
 name = "runkins"
-path = "../cli/src/runkins-cli.rs"
+path = "src/runkins-cli.rs"
 required-features = ["cli"]
 
 [[bin]]
 name = "runkins-server"
-path = "../server/src/runkins-server.rs"
+path = "src/runkins-server.rs"
 required-features = ["server"]
 
 [dependencies]

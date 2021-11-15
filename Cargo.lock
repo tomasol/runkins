@@ -755,21 +755,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "runkins_cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "dotenv",
- "env_logger",
- "log",
- "prost",
- "runkins_proto",
- "structopt",
- "tokio",
- "tonic",
-]
-
-[[package]]
 name = "runkins_lib"
 version = "0.1.0"
 dependencies = [
@@ -794,24 +779,6 @@ dependencies = [
  "prost",
  "tonic",
  "tonic-build",
-]
-
-[[package]]
-name = "runkins_server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "env_logger",
- "futures-core",
- "log",
- "prost",
- "rand",
- "runkins_lib",
- "runkins_proto",
- "tokio",
- "tokio-stream",
- "tonic",
- "tracing-core",
 ]
 
 [[package]]

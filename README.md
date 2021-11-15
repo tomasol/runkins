@@ -9,11 +9,9 @@ processes, stores stdout, stderr in memory and streams them to the CLI.
 * Light-weight CI: steps in a workflow can be triggered by exit codes, stdout content, timeouts etc.
 
 ## Folder structure
-* cli - binary package containing the `runkins` CLI
+* runkins - binary package containing the `runkins` CLI and the `runkins-server` gRPC server
 * lib - library used by the server, `examples/slow` binary for testing
 * proto - library and `*.proto` definition
-* server - binary package containing the `runkins-server` - gRPC server
-* all - binary package containing both the server and CLI
 * systemd - sample .service file
 
 ## Usage
