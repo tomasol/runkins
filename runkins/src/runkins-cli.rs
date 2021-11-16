@@ -58,7 +58,7 @@ enum Subcommand {
         #[structopt(env = "RUNKINS_EID")]
         pid: Pid,
     },
-    Output {
+    Logs {
         // TODO: rename to log(s)
         #[structopt(env = "RUNKINS_EID")]
         pid: Pid,
@@ -178,7 +178,7 @@ async fn send_request(
             info!("Response={:?}", response);
             Ok(())
         }
-        Subcommand::Output { pid, timeout_secs } => {
+        Subcommand::Logs { pid, timeout_secs } => {
             let request = tonic::Request::new(OutputRequest {
                 id: Some(ExecutionId { id: pid }),
             });
