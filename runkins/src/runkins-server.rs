@@ -319,7 +319,7 @@ async fn guess_cgroup_config() -> Option<Result<CGroupConfig, CGroupConfigError>
 
 async fn run_server() -> anyhow::Result<()> {
     // TODO low: make this configurable
-    let addr = "[::1]:50051".parse()?;
+    let addr = "127.0.0.1:50051".parse()?;
     let cgroup_config = match guess_cgroup_config().await {
         Some(Ok(cgroup_config)) => {
             info!("cgroup support enabled: {:?}", cgroup_config);
