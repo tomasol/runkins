@@ -52,7 +52,7 @@ runkins start -- ls -la
 ```
 The `start` subcommand outputs the RUNKINS_EID to stdout.
 
-All other subcommands (`status`, `stop`, `output`, `remove`) expect to receive it
+All other subcommands (`status`, `stop`, `output`, `rm`) expect to receive it
 either as the first parameter or as `RUNKINS_EID` environment variable.
 
 Example workflow:
@@ -62,7 +62,7 @@ echo "RUNKINS_EID=$RUNKINS_EID" > .env
 runkins status
 runkins output
 runkins stop
-runkins remove
+runkins rm
 rm .env
 ```
 To get help with commands, use `--help` flag.
@@ -128,7 +128,7 @@ Verify that the process runs in its own cgroup:
 $ RUNKINS_EID=$(runkins start --limits -- cat /proc/self/cgroup)
 $ runkins output $RUNKINS_EID
 0::/user.slice/user-1000.slice/user@1000.service/my.slice/15395846019127741322
-$ runkins remove $RUNKINS_EID
+$ runkins rm $RUNKINS_EID
 ```
 
 Verify that all required controllers `cpu io memory` are available:
@@ -137,7 +137,7 @@ $ RUNKINS_EID=$(runkins start --limits -- \
  sh -c 'cat /sys/fs/cgroup/$(cat /proc/self/cgroup | cut -d ':' -f 3)/cgroup.controllers')
 $ runkins output $RUNKINS_EID
 cpu io memory pids
-$ runkins remove $RUNKINS_EID
+$ runkins rm $RUNKINS_EID
 ```
 
 ### Setting cgroup limits via CLI
