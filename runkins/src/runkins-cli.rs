@@ -65,7 +65,7 @@ enum Subcommand {
         #[structopt(short, long, help = "Exit after given timeout in seconds")]
         timeout_secs: Option<u64>,
     },
-    Remove {
+    Rm {
         // TODO implement --force
         #[structopt(env = "RUNKINS_EID")]
         pid: Pid,
@@ -227,7 +227,7 @@ async fn send_request(
                 }
             }
         }
-        Subcommand::Remove { pid } => {
+        Subcommand::Rm { pid } => {
             let request = tonic::Request::new(RemoveRequest {
                 id: Some(ExecutionId { id: pid }),
             });
