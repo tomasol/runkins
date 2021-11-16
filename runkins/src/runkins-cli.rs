@@ -76,6 +76,12 @@ enum Subcommand {
         timeout_secs: Option<u64>,
     },
     Rm {
+        #[structopt(
+            short,
+            long,
+            help = "Remove RUNKINS_EID from .env file in current directory"
+        )]
+        cleanup_dot_env: bool,
         // TODO implement --force
         #[structopt(env = RUNKINS_EID)]
         pid: Pid,
@@ -241,13 +247,19 @@ async fn send_request(
                 }
             }
         }
-        Subcommand::Rm { pid } => {
+        Subcommand::Rm {
+            pid,
+            cleanup_dot_env,
+        } => {
             let request = tonic::Request::new(RemoveRequest {
                 id: Some(ExecutionId { id: pid }),
             });
             debug!("Request=${:?}", request);
             let response = client.remove(request).await?;
             info!("Response={:?}", response);
+            if cleanup_dot_env {
+                cleanup_dot_env_file()?;
+            }
             Ok(())
         }
         Subcommand::WaitUntil {
@@ -309,10 +321,14 @@ async fn wait_until_found(
 
 const DOT_ENV_PATH: &str = ".env";
 fn set_dot_env_file(runkins_eid: u64) -> Result<(), anyhow::Error> {
-    set_file(DOT_ENV_PATH, runkins_eid)
+    set_file(DOT_ENV_PATH, Some(runkins_eid))
 }
 
-fn set_file<P: AsRef<Path>>(as_path: P, runkins_eid: u64) -> Result<(), anyhow::Error> {
+fn cleanup_dot_env_file() -> Result<(), anyhow::Error> {
+    set_file(DOT_ENV_PATH, None)
+}
+
+fn set_file<P: AsRef<Path>>(as_path: P, runkins_eid: Option<u64>) -> Result<(), anyhow::Error> {
     let path = as_path.as_ref();
     let mut file = OpenOptions::new()
         .write(true)
@@ -330,7 +346,9 @@ fn set_file<P: AsRef<Path>>(as_path: P, runkins_eid: u64) -> Result<(), anyhow::
             file.write_all(format!("{}={}\n", key, val).as_bytes())?;
         }
     }
-    file.write_all(format!("{}={}\n", RUNKINS_EID, runkins_eid).as_bytes())?;
+    if let Some(runkins_eid) = runkins_eid {
+        file.write_all(format!("{}={}\n", RUNKINS_EID, runkins_eid).as_bytes())?;
+    }
     file.flush().context(format!("Cannot flush {:?}", path))?;
     let pos = file.seek(SeekFrom::Current(0))?;
     file.set_len(pos)
@@ -357,7 +375,7 @@ pub mod tests {
         let runkins_eid = 1;
         let tmpfile = NamedTempFile::new()?;
         debug!("Using temp file {:?}", tmpfile);
-        set_file(&tmpfile, runkins_eid)?;
+        set_file(&tmpfile, Some(runkins_eid))?;
         #[allow(deprecated)]
         let actual: Vec<(String, String)> = dotenv::from_path_iter(&tmpfile)
             .context(format!("Cannot parse file {:?}", tmpfile))?
@@ -395,7 +413,7 @@ pub mod tests {
             debug!("before: '{}'", buf);
         }
 
-        set_file(&tmpfile, runkins_eid)?;
+        set_file(&tmpfile, Some(runkins_eid))?;
         {
             let mut buf = String::new();
             tmpfile.reopen()?.read_to_string(&mut buf)?;
@@ -413,6 +431,51 @@ pub mod tests {
             ("key1".to_string(), "val1".to_string()),
             ("key2".to_string(), "val2".to_string()),
             (RUNKINS_EID.to_string(), runkins_eid.to_string()),
+        ];
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn should_remove_just_its_own_key() -> Result<(), anyhow::Error> {
+        before_all();
+        let mut tmpfile = NamedTempFile::new()?;
+        debug!("Using temp file {:?}", tmpfile);
+        writeln!(tmpfile, "key1=val1")?;
+        writeln!(
+            tmpfile,
+            "# comment comment comment comment comment comment comment comment"
+        )?;
+        writeln!(tmpfile, "{}={}", RUNKINS_EID, 10)?;
+        writeln!(tmpfile, "key2=val2")?;
+        writeln!(
+            tmpfile,
+            "# comment comment comment comment comment comment comment comment"
+        )?;
+
+        {
+            let mut buf = String::new();
+            tmpfile.reopen()?.read_to_string(&mut buf)?;
+            debug!("before: '{}'", buf);
+        }
+
+        set_file(&tmpfile, None)?;
+        {
+            let mut buf = String::new();
+            tmpfile.reopen()?.read_to_string(&mut buf)?;
+            debug!("after: '{}'", buf);
+        }
+        #[allow(deprecated)]
+        let actual: Vec<(String, String)> = dotenv::from_path_iter(&tmpfile)
+            .context(format!("Cannot parse file {:?}", tmpfile))?
+            .map(|it| {
+                it.context(format!("Cannot parse key/value pair of {:?}", tmpfile))
+                    .unwrap()
+            })
+            .collect();
+        let expected = vec![
+            ("key1".to_string(), "val1".to_string()),
+            ("key2".to_string(), "val2".to_string()),
         ];
         assert_eq!(actual, expected);
         Ok(())
