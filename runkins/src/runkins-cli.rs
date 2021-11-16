@@ -2,18 +2,28 @@ use anyhow::Context;
 use log::*;
 use runkins_proto::runkins::job_executor_client::*;
 use runkins_proto::runkins::*;
-use std::io::Write;
+use std::fs::OpenOptions;
+use std::io::{Seek, SeekFrom, Write};
+use std::path::Path;
 use std::time::Duration;
 use structopt::StructOpt;
 use tonic::transport::Channel;
 
 type Pid = u64;
 
+const RUNKINS_EID: &str = "RUNKINS_EID";
+
 #[derive(StructOpt, Debug)]
 #[structopt(about = "Job executor CLI")]
 enum Subcommand {
     Start {
-        // TODO: add --set-dot-env, pass current CWD, pass current env vars
+        // TODO: pass current CWD, pass env vars via -e
+        #[structopt(
+            short,
+            long,
+            help = "Set RUNKINS_EID to .env file in current directory"
+        )]
+        set_dot_env: bool,
         // TODO low: allow setting limits in human writable form e.g. 10MB, 5ms, etc.
         #[structopt(short, long, help = "Enable cgroup limits")]
         limits: bool,
@@ -51,27 +61,27 @@ enum Subcommand {
         args: Vec<String>,
     },
     Status {
-        #[structopt(env = "RUNKINS_EID")]
+        #[structopt(env = RUNKINS_EID)]
         pid: Pid,
     },
     Stop {
-        #[structopt(env = "RUNKINS_EID")]
+        #[structopt(env = RUNKINS_EID)]
         pid: Pid,
     },
     Logs {
         // TODO: rename to log(s)
-        #[structopt(env = "RUNKINS_EID")]
+        #[structopt(env = RUNKINS_EID)]
         pid: Pid,
         #[structopt(short, long, help = "Exit after given timeout in seconds")]
         timeout_secs: Option<u64>,
     },
     Rm {
         // TODO implement --force
-        #[structopt(env = "RUNKINS_EID")]
+        #[structopt(env = RUNKINS_EID)]
         pid: Pid,
     },
     WaitUntil {
-        #[structopt(env = "RUNKINS_EID")]
+        #[structopt(env = RUNKINS_EID)]
         pid: Pid,
         #[structopt(short, long, help = "Exit when message is found in std out")]
         message: Option<String>,
@@ -112,6 +122,7 @@ async fn send_request(
             io_max_riops,
             io_max_wbps,
             io_max_wiops,
+            set_dot_env,
         } => {
             let cgroup = if limits {
                 let cgroup = CGroup {
@@ -147,6 +158,9 @@ async fn send_request(
             info!("Response={:?}", response);
             let id = response.into_inner().id.unwrap();
             println!("{}", id.id);
+            if set_dot_env {
+                set_dot_env_file(id.id)?;
+            }
             Ok(())
         }
         Subcommand::Status { pid } => {
@@ -289,6 +303,118 @@ async fn wait_until_found(
     if message.is_some() {
         anyhow::bail!("Not found")
     } else {
+        Ok(())
+    }
+}
+
+const DOT_ENV_PATH: &str = ".env";
+fn set_dot_env_file(runkins_eid: u64) -> Result<(), anyhow::Error> {
+    set_file(DOT_ENV_PATH, runkins_eid)
+}
+
+fn set_file<P: AsRef<Path>>(as_path: P, runkins_eid: u64) -> Result<(), anyhow::Error> {
+    let path = as_path.as_ref();
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .context(format!("Cannot open {:?} file for writing", path))?;
+    #[allow(deprecated)]
+    for (key, val) in dotenv::from_path_iter(path)
+        .context(format!("Cannot parse file {:?}", path))?
+        .map(|it| {
+            it.context(format!("Cannot parse key/value pair of {:?}", path))
+                .unwrap()
+        })
+    {
+        if key != RUNKINS_EID {
+            file.write_all(format!("{}={}\n", key, val).as_bytes())?;
+        }
+    }
+    file.write_all(format!("{}={}\n", RUNKINS_EID, runkins_eid).as_bytes())?;
+    file.flush().context(format!("Cannot flush {:?}", path))?;
+    let pos = file.seek(SeekFrom::Current(0))?;
+    file.set_len(pos)
+        .context(format!("Cannot set length of file {:?} to {}", file, pos))
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+    use std::{io::Read, sync::Once};
+    use tempfile::NamedTempFile;
+
+    static INIT: Once = Once::new();
+
+    fn before_all() {
+        INIT.call_once(|| {
+            env_logger::init();
+        });
+    }
+
+    #[test]
+    fn should_create_env_file() -> Result<(), anyhow::Error> {
+        before_all();
+        let runkins_eid = 1;
+        let tmpfile = NamedTempFile::new()?;
+        debug!("Using temp file {:?}", tmpfile);
+        set_file(&tmpfile, runkins_eid)?;
+        #[allow(deprecated)]
+        let actual: Vec<(String, String)> = dotenv::from_path_iter(&tmpfile)
+            .context(format!("Cannot parse file {:?}", tmpfile))?
+            .map(|it| {
+                it.context(format!("Cannot parse key/value pair of {:?}", tmpfile))
+                    .unwrap()
+            })
+            .collect();
+        let expected = vec![(RUNKINS_EID.to_string(), runkins_eid.to_string())];
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn should_rewrite_just_its_own_key() -> Result<(), anyhow::Error> {
+        before_all();
+        let runkins_eid = 1;
+        let mut tmpfile = NamedTempFile::new()?;
+        debug!("Using temp file {:?}", tmpfile);
+        writeln!(tmpfile, "key1=val1")?;
+        writeln!(
+            tmpfile,
+            "# comment comment comment comment comment comment comment comment"
+        )?;
+        writeln!(tmpfile, "{}={}", RUNKINS_EID, 10)?;
+        writeln!(tmpfile, "key2=val2")?;
+        writeln!(
+            tmpfile,
+            "# comment comment comment comment comment comment comment comment"
+        )?;
+
+        {
+            let mut buf = String::new();
+            tmpfile.reopen()?.read_to_string(&mut buf)?;
+            debug!("before: '{}'", buf);
+        }
+
+        set_file(&tmpfile, runkins_eid)?;
+        {
+            let mut buf = String::new();
+            tmpfile.reopen()?.read_to_string(&mut buf)?;
+            debug!("after: '{}'", buf);
+        }
+        #[allow(deprecated)]
+        let actual: Vec<(String, String)> = dotenv::from_path_iter(&tmpfile)
+            .context(format!("Cannot parse file {:?}", tmpfile))?
+            .map(|it| {
+                it.context(format!("Cannot parse key/value pair of {:?}", tmpfile))
+                    .unwrap()
+            })
+            .collect();
+        let expected = vec![
+            ("key1".to_string(), "val1".to_string()),
+            ("key2".to_string(), "val2".to_string()),
+            (RUNKINS_EID.to_string(), runkins_eid.to_string()),
+        ];
+        assert_eq!(actual, expected);
         Ok(())
     }
 }
