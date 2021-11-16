@@ -88,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
     let opt = Subcommand::from_args();
     // TODO low: make this configurable
-    let addr = "http://[::1]:50051";
+    let addr = "http://127.0.0.1:50051";
     let client = JobExecutorClient::connect(addr)
         .await
         .with_context(|| format!("Cannot connect to {}", addr))?;
