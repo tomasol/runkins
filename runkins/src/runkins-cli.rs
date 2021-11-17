@@ -363,6 +363,7 @@ fn cleanup_dot_env_file() -> Result<(), anyhow::Error> {
 fn set_file<P: AsRef<Path>>(as_path: P, runkins_eid: Option<u64>) -> Result<(), anyhow::Error> {
     let path = as_path.as_ref();
     let mut file = OpenOptions::new()
+        .create(true)
         .write(true)
         .open(path)
         .context(format!("Cannot open {:?} file for writing", path))?;
@@ -407,6 +408,8 @@ pub mod tests {
         let runkins_eid = 1;
         let tmpfile = NamedTempFile::new()?;
         debug!("Using temp file {:?}", tmpfile);
+
+        std::fs::remove_file(&tmpfile)?;
         set_file(&tmpfile, Some(runkins_eid))?;
         #[allow(deprecated)]
         let actual: Vec<(String, String)> = dotenv::from_path_iter(&tmpfile)
