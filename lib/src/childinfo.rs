@@ -6,9 +6,7 @@ use crate::cgroup::server_config::CGroupConfig;
 use crate::cgroup::server_config::ChildCGroup;
 use crate::event_storage::{EventStorage, EventSubscription};
 use log::*;
-use std::ffi::OsStr;
 use std::fmt::{Debug, Display};
-use std::process::ExitStatus;
 use std::process::Stdio;
 use std::time::Duration;
 use thiserror::Error;
@@ -99,6 +97,8 @@ impl Display for ActorEvent {
 #[derive(Debug)]
 pub struct ChildInfo {
     pid: Pid,
+    program: String,
+    args: Vec<String>,
     main_tx: mpsc::Sender<ActorEvent>,
     child_cgroup: Option<ChildCGroup>,
 }
@@ -186,15 +186,6 @@ pub enum CompleteExitStatus {
     Unknown(String),
 }
 
-impl<ERR: std::error::Error> From<Result<ExitStatus, ERR>> for CompleteExitStatus {
-    fn from(src: Result<ExitStatus, ERR>) -> Self {
-        match src {
-            Ok(status) => CompleteExitStatus::Complete(status.code().into()),
-            Err(err) => CompleteExitStatus::Unknown(err.to_string()),
-        }
-    }
-}
-
 enum ExitStatusOrListeners {
     ExitStatus(CompleteExitStatus),
     Listeners(Vec<oneshot::Sender<CompleteExitStatus>>),
@@ -221,6 +212,14 @@ impl Display for ExitStatusOrListeners {
 }
 
 impl ChildInfo {
+    pub fn program(&self) -> &str {
+        &self.program
+    }
+
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+
     async fn rpc<F: Fn(oneshot::Sender<RESP>) -> ActorEvent, RESP>(
         &self,
         event_fn: F,
@@ -355,7 +354,7 @@ impl ChildInfo {
                     .await
             })
         };
-        let status = loop {
+        let status_result = loop {
             tokio::select! {
                 new_status = child.wait() => {
                     break new_status;
@@ -365,8 +364,14 @@ impl ChildInfo {
                     let _ = child.start_kill(); // ignore error when process is already killed
                 }
             }
-        }
-        .into();
+        };
+        let status = match status_result {
+            Ok(status) => CompleteExitStatus::Complete(status.code().into()),
+            Err(err) => {
+                error!("[{}] Cannot get job status - {}", pid, err);
+                CompleteExitStatus::Unknown(err.to_string())
+            }
+        };
         debug!("[{}] child_actor got {:?}", pid, status);
 
         // Make sure forwarder tasks finish. Otherwise ChunkAdded events could be emitted after ProcessFinished.
@@ -500,65 +505,47 @@ impl ChildInfo {
         }
     }
 
-    pub fn new<STR, STR2, ITER>(
+    pub fn new(
         pid: Pid,
-        process_path: STR,
-        process_args: ITER,
-    ) -> Result<Self, ChildInfoCreationError>
-    where
-        ITER: IntoIterator<Item = STR2>,
-        STR: AsRef<OsStr>,
-        STR2: AsRef<OsStr>,
-    {
-        let mut command = Command::new(&process_path);
-        command.args(process_args);
-        Self::new_internal(pid, command, &process_path, None)
+        program: String,
+        args: Vec<String>,
+    ) -> Result<Self, ChildInfoCreationError> {
+        Self::new_internal(pid, Command::new(&program), program, args, None)
     }
 
-    pub async fn new_with_cgroup<STR, STR2, ITER>(
+    pub async fn new_with_cgroup(
         pid: Pid,
-        process_path: STR,
-        process_args: ITER,
+        program: String,
+        args: Vec<String>,
         cgroup_config: &CGroupConfig,
         limits: CGroupLimits,
-    ) -> Result<Self, ChildInfoCreationWithCGroupError>
-    where
-        ITER: ExactSizeIterator<Item = STR2>,
-        STR: AsRef<OsStr>,
-        STR2: AsRef<OsStr>,
-    {
+    ) -> Result<Self, ChildInfoCreationWithCGroupError> {
         // construct command based on path and args
-        let (command, child_cgroup) = CGroupCommandFactory::create_command(
-            cgroup_config,
-            pid,
-            &process_path,
-            process_args,
-            limits,
-        )
-        .await
-        .map_err(|err| ChildInfoCreationWithCGroupError::ProcessExecutionError(pid, err))?;
-        Self::new_internal(pid, command, &process_path.as_ref(), Some(child_cgroup))
+        let (command, child_cgroup) =
+            CGroupCommandFactory::create_command(cgroup_config, pid, &program, limits)
+                .await
+                .map_err(|err| ChildInfoCreationWithCGroupError::ProcessExecutionError(pid, err))?;
+        Self::new_internal(pid, command, program, args, Some(child_cgroup))
             .map_err(|err| ChildInfoCreationWithCGroupError::ChildInfoCreationError(pid, err))
     }
 
-    fn new_internal<STR>(
+    fn new_internal(
         pid: Pid,
         mut command: Command,
-        process_path: STR,
+        program: String,
+        args: Vec<String>,
         child_cgroup: Option<ChildCGroup>,
-    ) -> Result<Self, ChildInfoCreationError>
-    where
-        STR: AsRef<OsStr>,
-    {
+    ) -> Result<Self, ChildInfoCreationError> {
         debug!("[{}] Starting new process: {:?}", pid, command);
         // consider adding ability to control env.vars
         command
+            .args(&args)
             .current_dir(".") // consider making this configurable
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn().map_err(|err| {
-            info!("[{}] Cannot run process - {:?}", pid, process_path.as_ref());
+            info!("[{}] Cannot run process - {:?}", pid, program);
             ChildInfoCreationError::CannotRunProcess(pid, err)
         })?;
         debug!(
@@ -600,6 +587,8 @@ impl ChildInfo {
 
         Ok(ChildInfo {
             pid,
+            program,
+            args,
             main_tx,
             child_cgroup,
         })
@@ -692,7 +681,11 @@ mod tests {
             .join("slow");
         assert!(slow.exists(), "{:?} does not exist", slow);
 
-        let child_info = ChildInfo::new(pid, slow, ["2"].iter())?;
+        let child_info = ChildInfo::new(
+            pid,
+            slow.to_string_lossy().into_owned(),
+            vec!["2".to_string()],
+        )?;
         let start = Instant::now();
         debug!("Started at {:?}", start);
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -890,8 +883,8 @@ mod tests {
             {
                 let child_info = ChildInfo::new_with_cgroup(
                     pid,
-                    "cat",
-                    ["/proc/self/cgroup"].iter(),
+                    "cat".to_string(),
+                    vec!["/proc/self/cgroup".to_string()],
                     &cgroup_config,
                     Default::default(),
                 )
@@ -913,8 +906,8 @@ mod tests {
                 let cgroup_controllers = expected_child_cgroup_path.join("cgroup.controllers");
                 let child_info = ChildInfo::new_with_cgroup(
                     pid,
-                    "cat",
-                    [cgroup_controllers].iter(),
+                    "cat".to_string(),
+                    vec![cgroup_controllers.to_string_lossy().into_owned()],
                     &cgroup_config,
                     Default::default(),
                 )
