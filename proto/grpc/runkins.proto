@@ -3,6 +3,8 @@ syntax = "proto3";
 package runkins;
 
 service JobExecutor {
+    // list executions
+    rpc ListExecutions(ListExecutionsRequest) returns (ListExecutionsResponse);
     // Start new job, return ExecutionId handle for other RPCs
     rpc Start(StartRequest) returns (StartResponse);
     // Kill the job
@@ -20,6 +22,21 @@ service JobExecutor {
 
 message ExecutionId {
     uint64 id = 1;
+}
+
+message ExecutionDetail {
+    ExecutionId id = 1;
+    string program = 2;
+    repeated string args = 3;
+    StatusResponse status = 4;
+}
+
+message ListExecutionsRequest {
+
+}
+
+message ListExecutionsResponse {
+    repeated ExecutionDetail details = 1;
 }
 
 message CGroup {
@@ -56,7 +73,7 @@ message BlockDeviceLimit {
 }
 
 message StartRequest {
-    string path = 1;
+    string program = 1;
     repeated string args = 2;
     optional CGroup cgroup = 3;
     // TODO low: consider adding working directory and env. vars
@@ -79,14 +96,22 @@ message StatusRequest {
 
 message StatusResponse {
 
-    enum RunningStatus {
-        RUNNING = 0;
-        EXITED_WITH_SIGNAL = 1;
-        EXITED_WITH_CODE = 2;
+    message Running {
     }
 
-    RunningStatus status = 1;
-    optional int32 exit_code = 2;
+    message ExitedWithCode {
+        int32 code = 1;
+    }
+
+    message ExitedWithSignal {
+    }
+
+
+    oneof status {
+        Running running = 1;
+        ExitedWithCode exited_with_code = 2;
+        ExitedWithSignal exited_with_signal = 3;
+    }
 }
 
 message OutputRequest {

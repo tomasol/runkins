@@ -194,17 +194,14 @@ pub mod runtime {
         /// Create new [`Command`] using program name and arguments.
         /// If cgroup_config is set to support cgroup, new cgroup will
         /// be created no matter if limits are provided or not.
-        pub async fn create_command<ITER, STR, STR2>(
+        pub async fn create_command<STR>(
             cgroup_config: &CGroupConfig,
             pid: Pid,
             program: &STR,
-            args: ITER,
             limits: CGroupLimits,
         ) -> Result<(Command, ChildCGroup), CGroupCommandError>
         where
-            ITER: ExactSizeIterator<Item = STR2>,
             STR: AsRef<OsStr>,
-            STR2: AsRef<OsStr>,
         {
             let child_cgroup = cgroup_config
                 .create_child_cgroup_folder(pid)
@@ -240,7 +237,6 @@ pub mod runtime {
             }?;
 
             let mut command = Command::new(program);
-            command.args(args);
             let child_cgroup_path = child_cgroup.as_path().to_owned();
             unsafe {
                 command.pre_exec(move || {

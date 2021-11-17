@@ -93,8 +93,7 @@ impl MyJobExecutor {
     ) -> Result<ChildInfo, tonic::Status> {
         Ok(match (limits, &self.cgroup_config) {
             (Some(limits), Some(cgroup_config)) => {
-                ChildInfo::new_with_cgroup(pid, path, args.into_iter(), cgroup_config, limits)
-                    .await?
+                ChildInfo::new_with_cgroup(pid, path, args, cgroup_config, limits).await?
             }
             (None, _) => ChildInfo::new(pid, path, args)?,
             _ => {
@@ -130,7 +129,7 @@ impl JobExecutor for MyJobExecutor {
         let child_info = self
             .create_child_info(
                 pid,
-                start_req.path,
+                start_req.program,
                 start_req.args,
                 start_req.cgroup.map(Self::construct_limits),
             )
@@ -169,28 +168,9 @@ impl JobExecutor for MyJobExecutor {
             .get(&pid)
             .ok_or_else(|| tonic::Status::not_found("Cannot find job"))?;
 
-        let mut exit_code = None;
-        let status = match child_info.status().await? {
-            // must not block
-            RunningState::Running => Ok(status_response::RunningStatus::Running),
-            RunningState::Finished(FinishedState::WithExitCode(code)) => {
-                exit_code = Some(code);
-                Ok(status_response::RunningStatus::ExitedWithCode)
-            }
-            RunningState::Finished(FinishedState::WithSignal) => {
-                Ok(status_response::RunningStatus::ExitedWithSignal)
-            }
-            RunningState::Unknown(reason) => {
-                error!("[{}] Cannot get job status - {}", pid, reason);
-                Err(tonic::Status::internal(
-                    "Cannot get job status, not removing",
-                ))
-            }
-        }?;
-        Ok(Response::new(StatusResponse {
-            status: status as i32,
-            exit_code,
-        }))
+        //let mut exit_code = None;
+        let status_response = state_to_status(child_info.status().await?)?;
+        Ok(Response::new(status_response))
     }
 
     async fn stop(
@@ -288,6 +268,53 @@ impl JobExecutor for MyJobExecutor {
         }?;
         Ok(Response::new(RemoveResponse {}))
     }
+
+    async fn list_executions(
+        &self,
+        _request: tonic::Request<ListExecutionsRequest>,
+    ) -> Result<tonic::Response<ListExecutionsResponse>, tonic::Status> {
+        let child_storage = self.child_storage.lock().await;
+        // FIXME: many awaits while holding a lock
+        let mut details: Vec<ExecutionDetail> = Vec::with_capacity(child_storage.len());
+        for (pid, child_info) in child_storage.iter() {
+            let detail = ExecutionDetail {
+                id: Some(ExecutionId { id: *pid }),
+                program: child_info.program().to_string(),
+                args: child_info.args().to_owned(),
+                status: child_info
+                    .status()
+                    .await
+                    .ok()
+                    .map(state_to_status)
+                    .map(Result::ok)
+                    .flatten(),
+            };
+            details.push(detail);
+        }
+        Ok(Response::new(ListExecutionsResponse { details }))
+    }
+}
+
+fn state_to_status(state: RunningState) -> Result<StatusResponse, tonic::Status> {
+    match state {
+        // must not block
+        RunningState::Running => Ok(status_response::Status::Running(
+            status_response::Running {},
+        )),
+        RunningState::Finished(FinishedState::WithExitCode(code)) => {
+            //exit_code = Some(code);
+            Ok(status_response::Status::ExitedWithCode(
+                status_response::ExitedWithCode { code },
+            ))
+        }
+        RunningState::Finished(FinishedState::WithSignal) => Ok(
+            status_response::Status::ExitedWithSignal(status_response::ExitedWithSignal {}),
+        ),
+        RunningState::Unknown(_) => Err(tonic::Status::internal("Cannot get job status")),
+    }
+    .map(|status| StatusResponse {
+        status: Some(status),
+    })
 }
 
 // TODO externalize env vars
@@ -364,7 +391,7 @@ pub mod tests {
 
     #[test]
     pub fn test_cannot_run_process() {
-        match ChildInfo::new(1, "", [] as [&str; 0]) {
+        match ChildInfo::new(1, "".to_string(), vec![]) {
             Err(ChildInfoCreationError::CannotRunProcess(pid, _)) => {
                 assert_eq!(pid, 1);
             }

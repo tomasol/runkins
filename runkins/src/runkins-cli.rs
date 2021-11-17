@@ -56,7 +56,7 @@ enum Subcommand {
         #[structopt(long, help = "Set io.max, wiops value", requires("limits"))]
         io_max_wiops: Option<u64>,
 
-        path: String,
+        program: String,
         #[structopt()]
         args: Vec<String>,
     },
@@ -94,7 +94,7 @@ enum Subcommand {
         #[structopt(short, long, help = "Fail after given timeout in seconds")]
         timeout_secs: Option<u64>,
     },
-    // TODO implement ps, ps -a
+    Ps {},
 }
 
 #[tokio::main]
@@ -117,7 +117,7 @@ async fn send_request(
 ) -> Result<(), anyhow::Error> {
     match opt {
         Subcommand::Start {
-            path,
+            program,
             args,
             limits,
             memory_max,
@@ -158,7 +158,11 @@ async fn send_request(
                 None
             };
 
-            let request = tonic::Request::new(StartRequest { path, args, cgroup });
+            let request = tonic::Request::new(StartRequest {
+                program,
+                args,
+                cgroup,
+            });
             debug!("Request=${:?}", request);
             let response = client.start(request).await?;
             info!("Response={:?}", response);
@@ -177,15 +181,7 @@ async fn send_request(
             let response = client.job_status(request).await?;
             info!("Response={:?}", response);
             let status_response = response.into_inner();
-            let message = match status_response.status() {
-                status_response::RunningStatus::Running => "Running".to_string(),
-                status_response::RunningStatus::ExitedWithSignal => {
-                    "Exited with signal".to_string()
-                }
-                status_response::RunningStatus::ExitedWithCode => {
-                    format!("Exited with code {}", status_response.exit_code.unwrap())
-                }
-            };
+            let message = status_to_string(status_response.status.expect("Status not found"));
             println!("{}", message);
             Ok(())
         }
@@ -273,6 +269,42 @@ async fn send_request(
             debug!("Request=${:?}", request);
             let stream = client.get_output(request).await?.into_inner();
             return wait_until(stream, message, timeout_secs.map(Duration::from_secs)).await;
+        }
+        Subcommand::Ps {} => {
+            let request = tonic::Request::new(ListExecutionsRequest {});
+            debug!("Request=${:?}", request);
+            let response = client.list_executions(request).await?;
+            info!("Response={:?}", response);
+            println!("id\tprogram\targs\tstatus");
+            let mut table = tabular::Table::new("{:<} {:<} {:<} {:<}");
+            table.add_row(
+                tabular::Row::new()
+                    .with_cell(RUNKINS_EID)
+                    .with_cell("Program")
+                    .with_cell("Arguments")
+                    .with_cell("Status"),
+            );
+            for detail in response.into_inner().details {
+                table.add_row(
+                    tabular::Row::new()
+                        .with_cell(detail.id.unwrap().id)
+                        .with_cell(detail.program)
+                        .with_cell(format!("{:?}", detail.args))
+                        .with_cell(status_to_string(detail.status.unwrap().status.unwrap())),
+                );
+            }
+            print!("{}", table);
+            Ok(())
+        }
+    }
+}
+
+fn status_to_string(status: status_response::Status) -> String {
+    match status {
+        status_response::Status::Running(_) => "Running".to_string(),
+        status_response::Status::ExitedWithSignal(_) => "Exited with signal".to_string(),
+        status_response::Status::ExitedWithCode(status_response::ExitedWithCode { code }) => {
+            format!("Exited with code {}", code)
         }
     }
 }
