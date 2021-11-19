@@ -52,7 +52,7 @@ runkins start -- ls -la
 ```
 The `start` subcommand outputs the RUNKINS_EID to stdout.
 
-All other subcommands (`status`, `stop`, `output`, `rm`) expect to receive it
+All other subcommands (`status`, `stop`, `logs`, `rm`) expect to receive it
 either as the first parameter or as `RUNKINS_EID` environment variable.
 
 Example workflow:
@@ -60,7 +60,7 @@ Example workflow:
 RUNKINS_EID=$(runkins start -- ls -la)
 echo "RUNKINS_EID=$RUNKINS_EID" > .env
 runkins status
-runkins output
+runkins logs
 runkins stop
 runkins rm
 rm .env
@@ -85,7 +85,7 @@ Start the server, then execute the binary
 ```sh
 RUNKINS_EID=$(runkins start -- cargo run --example slow 10)
 ```
-Test that the system works as expected. The `output` subcommand
+Test that the system works as expected. The `logs` subcommand
 should write lines to stdout and stderr. After the program
 writes 10 lines, the clients should disconnect and the status
 should be `Exited with code 0`.
@@ -126,7 +126,7 @@ Verify that the process runs in its own cgroup:
 ```sh
 # note the --limits flag - if not set, cgroup will not be created
 $ RUNKINS_EID=$(runkins start --limits -- cat /proc/self/cgroup)
-$ runkins output $RUNKINS_EID
+$ runkins logs $RUNKINS_EID
 0::/user.slice/user-1000.slice/user@1000.service/my.slice/15395846019127741322
 $ runkins rm $RUNKINS_EID
 ```
@@ -135,7 +135,7 @@ Verify that all required controllers `cpu io memory` are available:
 ```sh
 $ RUNKINS_EID=$(runkins start --limits -- \
  sh -c 'cat /sys/fs/cgroup/$(cat /proc/self/cgroup | cut -d ':' -f 3)/cgroup.controllers')
-$ runkins output $RUNKINS_EID
+$ runkins logs $RUNKINS_EID
 cpu io memory pids
 $ runkins rm $RUNKINS_EID
 ```
