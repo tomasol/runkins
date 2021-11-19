@@ -8,8 +8,8 @@ license = "MIT"
 repository = "https://github.com/tomasol/runkins"
 
 [dependencies]
-prost = "0.8"
-tonic = "0.5"
+prost = "0.9.0"
+tonic = "0.6.1"
 
 [build-dependencies]
-tonic-build = "0.5"
+tonic-build = "0.6.0"
