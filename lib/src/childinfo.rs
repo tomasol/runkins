@@ -427,16 +427,7 @@ impl ChildInfo {
         let mut event_storage = EventStorage::new(Self::EVENT_STORAGE_CAPACITY);
         let mut status = ExitStatusOrListeners::Listeners(vec![]);
 
-        loop {
-            let event = tokio::select! {
-                Some(event) = rx.recv() => {
-                    event
-                },
-                else => {
-                    debug!("[{}] main_actor is terminating", pid);
-                    break;
-                }
-            };
+        while let Some(event) = rx.recv().await {
             debug!("[{}] main_actor event={}, status={}", pid, event, status);
             trace!("[{}] main_actor event={:?}", pid, event);
             // FIXME: cleanup resources when panicing in main_actor
@@ -503,6 +494,7 @@ impl ChildInfo {
                 }
             }
         }
+        debug!("[{}] main_actor is terminating", pid);
     }
 
     pub fn new(
