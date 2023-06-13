@@ -275,22 +275,21 @@ async fn send_request(
             debug!("Request=${:?}", request);
             let response = client.list_executions(request).await?;
             info!("Response={:?}", response);
-            println!("id\tprogram\targs\tstatus");
             let mut table = tabular::Table::new("{:<} {:<} {:<} {:<}");
             table.add_row(
                 tabular::Row::new()
                     .with_cell(RUNKINS_EID)
-                    .with_cell("Program")
-                    .with_cell("Arguments")
-                    .with_cell("Status"),
+                    .with_cell("STATUS")
+                    .with_cell("PROGRAM")
+                    .with_cell("ARGS"),
             );
             for detail in response.into_inner().details {
                 table.add_row(
                     tabular::Row::new()
                         .with_cell(detail.id.unwrap().id)
+                        .with_cell(status_to_string(detail.status.unwrap().status.unwrap()))
                         .with_cell(detail.program)
-                        .with_cell(format!("{:?}", detail.args))
-                        .with_cell(status_to_string(detail.status.unwrap().status.unwrap())),
+                        .with_cell(format!("{:?}", detail.args)),
                 );
             }
             print!("{}", table);
