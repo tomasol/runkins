@@ -1,5 +1,4 @@
-#![feature(type_alias_impl_trait)]
-
+use futures_core::Stream;
 use log::*;
 use rand::prelude::*;
 use runkins_lib::cgroup::concepts::CGroupLimits;
@@ -14,6 +13,7 @@ use runkins_lib::childinfo::RunningState;
 use runkins_proto::runkins::job_executor_server::*;
 use runkins_proto::runkins::*;
 use std::collections::HashMap;
+use std::pin::Pin;
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::StreamExt;
@@ -194,7 +194,8 @@ impl JobExecutor for MyJobExecutor {
         Ok(Response::new(StopResponse {}))
     }
 
-    type GetOutputStream = impl futures_core::Stream<Item = Result<OutputResponse, tonic::Status>>;
+    type GetOutputStream =
+        Pin<Box<dyn Stream<Item = Result<OutputResponse, tonic::Status>> + Send>>;
 
     async fn get_output(
         &self,
@@ -218,7 +219,7 @@ impl JobExecutor for MyJobExecutor {
             .await?
             .map(MyJobExecutor::chunk_to_output);
 
-        Ok(Response::new(event_stream))
+        Ok(Response::new(Box::pin(event_stream)))
     }
 
     async fn remove(
