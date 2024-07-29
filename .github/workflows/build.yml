@@ -10,7 +10,7 @@ jobs:
       - name: Install stable toolchain
         uses: actions-rs/toolchain@v1
         with:
-          toolchain: stable
+          toolchain: "1.79.0"
           components: rustfmt, clippy
 
       - name: Install cache
@@ -43,7 +43,7 @@ jobs:
       - name: Install stable toolchain
         uses: actions-rs/toolchain@v1
         with:
-          toolchain: stable
+          toolchain: "1.79.0"
           components: rustfmt, clippy
 
       - name: Install cache
