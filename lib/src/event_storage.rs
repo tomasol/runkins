@@ -49,13 +49,13 @@ pin_project! {
 impl<I: 'static + Debug + Clone> EventStream<I> {
     fn new_accumulated(accumulated: I) -> Self {
         EventStream::ClosedForEvents {
-            first: tokio_stream::iter(Some(Ok(accumulated)).into_iter()),
+            first: tokio_stream::iter(Some(Ok(accumulated))),
         }
     }
 
     fn new_broadcast(accumulated: I, broadcast: BroadcastStream<I>) -> Self {
         EventStream::OpenForEvents {
-            first: tokio_stream::iter(Some(Ok(accumulated)).into_iter()),
+            first: tokio_stream::iter(Some(Ok(accumulated))),
             broadcast,
         }
     }

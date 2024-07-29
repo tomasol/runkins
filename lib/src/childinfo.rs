@@ -806,7 +806,7 @@ mod tests {
                 conf: &EnvVarConfiguration,
             ) -> Result<String, anyhow::Error> {
                 let output = Command::new("systemd-run")
-                    .args(&[
+                    .args([
                         "--user",
                         "-p",
                         "Delegate=yes",

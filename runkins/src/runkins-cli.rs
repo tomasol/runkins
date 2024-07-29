@@ -3,7 +3,7 @@ use log::*;
 use runkins_proto::runkins::job_executor_client::*;
 use runkins_proto::runkins::*;
 use std::fs::OpenOptions;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Seek, Write};
 use std::path::Path;
 use std::time::Duration;
 use structopt::StructOpt;
@@ -268,7 +268,7 @@ async fn send_request(
             });
             debug!("Request=${:?}", request);
             let stream = client.get_output(request).await?.into_inner();
-            return wait_until(stream, message, timeout_secs.map(Duration::from_secs)).await;
+            wait_until(stream, message, timeout_secs.map(Duration::from_secs)).await
         }
         Subcommand::Ps {} => {
             let request = tonic::Request::new(ListExecutionsRequest {});
@@ -363,6 +363,7 @@ fn set_file<P: AsRef<Path>>(as_path: P, runkins_eid: Option<u64>) -> Result<(), 
     let path = as_path.as_ref();
     let mut file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .open(path)
         .context(format!("Cannot open {:?} file for writing", path))?;
@@ -382,7 +383,7 @@ fn set_file<P: AsRef<Path>>(as_path: P, runkins_eid: Option<u64>) -> Result<(), 
         file.write_all(format!("{}={}\n", RUNKINS_EID, runkins_eid).as_bytes())?;
     }
     file.flush().context(format!("Cannot flush {:?}", path))?;
-    let pos = file.seek(SeekFrom::Current(0))?;
+    let pos = file.stream_position()?;
     file.set_len(pos)
         .context(format!("Cannot set length of file {:?} to {}", file, pos))
 }

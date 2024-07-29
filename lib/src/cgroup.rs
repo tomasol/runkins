@@ -245,7 +245,7 @@ pub mod runtime {
                     let mut cgroup_procs = std::fs::OpenOptions::new()
                         .read(true)
                         .write(true)
-                        .open(&cgroup_procs_path)?;
+                        .open(cgroup_procs_path)?;
 
                     std::io::Seek::seek(&mut cgroup_procs, std::io::SeekFrom::End(0))?;
                     std::io::Write::write(

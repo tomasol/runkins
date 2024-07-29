@@ -287,8 +287,7 @@ impl JobExecutor for MyJobExecutor {
                     .await
                     .ok()
                     .map(state_to_status)
-                    .map(Result::ok)
-                    .flatten(),
+                    .and_then(Result::ok),
             };
             details.push(detail);
         }
